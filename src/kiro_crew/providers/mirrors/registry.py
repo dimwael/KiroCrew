@@ -32,6 +32,7 @@ from enum import Enum
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
@@ -65,6 +66,17 @@ class ProjectionKind(str, Enum):
     #: kind under which a session legitimately holds none of Crew's tools, and the
     #: only one that has to name what would have to exist for that to change.
     NO_CHANNEL = "no-channel"
+    #: The shared MCP broker reaches this backend on a transport it advertises, and
+    #: no spec projection is written for it. So the session holds Crew's POOLED
+    #: tools -- the stubs ``_pooled_mcp_servers`` appends for a backend outside
+    #: :data:`MIRRORS` -- and not the servers its own agent spec declares.
+    #:
+    #: Distinct from ``no-channel`` because the difference is observable in a
+    #: session: there the array carries nothing Crew put in it, here it carries the
+    #: broker. And distinct from ``mirror`` because the spec's own servers and its
+    #: per-tool deny set do not travel. Not a finished state, so it names its
+    #: ``tracking`` like the two kinds above.
+    BROKER_ONLY = "broker-only"
 
 
 class PerToolDeny(str, Enum):
@@ -140,6 +152,11 @@ class McpProjection:
     def __post_init__(self) -> None:
         if not self.reason.strip():
             raise ValueError("an McpProjection needs a reason")
+        if self.kind is ProjectionKind.BROKER_ONLY and not self.tracking.strip():
+            raise ValueError(
+                "a broker-only projection must name its tracking issue or doc anchor "
+                "for the spec projection it still lacks"
+            )
         if self.kind is ProjectionKind.NO_CHANNEL:
             if not self.channel.strip():
                 raise ValueError(
@@ -287,6 +304,27 @@ PROJECTIONS: dict[str, McpProjection] = {
             "change does this by loading a bridge extension into pi), or an extension "
             "of Crew's that bridges MCP the way the gate extension bridges permissions "
             "-- the one channel this harness is shown to read today"
+        ),
+        tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
+    ),
+    ACP_BACKEND_DEEPSEEK: McpProjection(
+        kind=ProjectionKind.BROKER_ONLY,
+        reason=(
+            "deepseek accepts stdio entries in the session/new mcpServers array, which "
+            "is why it IS in ACP_BACKENDS_SESSION_MCP_ARRAY and why it is not a "
+            "no-channel: the broker stubs _pooled_mcp_servers appends for a backend "
+            "outside MIRRORS are shaped as stdio elements "
+            "(mcp_gateway.session_servers._acp_server_entry emits command/args/env) and "
+            "that is the shape this harness mounts. Captured end to end rather than "
+            "inferred: test/fixtures/acp_frames/deepseek/mcp-stdio-mount-live.jsonl sends "
+            "one such element pointing at a real stdio MCP server, session/new returns a "
+            "sessionId, the server is asked initialize/tools/list/tools/call, and the "
+            "turn carries the resulting tool_call and its result. So a deepseek session "
+            "holds Crew's pooled tools, and holds them reachably. What it does not hold "
+            "is the servers its own agent spec declares, or the spec's per-tool deny "
+            "set, because no mirror translates them. One hazard rides along, in "
+            "mcp-stdio-rollback-live.jsonl: an element whose command cannot start fails "
+            "the WHOLE session rather than being dropped"
         ),
         tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
     ),

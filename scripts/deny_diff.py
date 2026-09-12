@@ -154,6 +154,10 @@ _INHERITED_HOME_OVERRIDE_ENV_VARS = (
     "XDG_DATA_HOME",
     # pi's whole agent directory, credential store included, follows this one.
     "PI_CODING_AGENT_DIR",
+    # DeepSeek Harness relocates its WHOLE home, credential store included, from one
+    # variable. Same reasoning as the entry above, and the source test pins this tuple
+    # against the harness declarations so a new override cannot be forgotten here.
+    "DSH_HOME",
 )
 
 

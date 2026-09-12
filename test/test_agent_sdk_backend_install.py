@@ -61,12 +61,14 @@ def _stub_resolvers(
     kiro="/usr/local/bin/kiro-cli",
     adapter=(["node", "/n/acp.js"], "/usr/bin"),
     claude_cli="/usr/local/bin/claude",
+    codex=(None, "/usr/bin"),
     opencode=("/usr/local/bin/opencode", "/usr/bin"),
     pi_acp=(["node", "/n/pi-acp.js"], "/usr/bin"),
     pi_cli=("/usr/local/bin/pi", "/usr/bin"),
     codex_acp=(["node", "/n/codex-acp.js"], "/usr/bin"),
+    deepseek=("/usr/local/bin/dsh", "/usr/bin"),
 ):
-    """Patch the four spawn resolvers on the module the driver imports from.
+    """Patch the spawn resolvers on the module the driver imports from.
 
     Patched on ``kiro_crew.acp.client`` -- the DEFINING module -- because the
     driver imports them function-locally at call time, so that is the namespace
@@ -91,6 +93,9 @@ def _stub_resolvers(
     # HAS the codex adapter installed the real resolver answers ``installed`` and the
     # test fails for a property of the machine rather than of the code.
     monkeypatch.setattr(client, "_resolve_codex_acp_bin", lambda: codex_acp)
+    # deepseek, for that same reason: its binary may be present on the host running
+    # the suite, and the payload assertion pins its row as ``missing``.
+    monkeypatch.setattr(client, "_resolve_deepseek_bin", lambda: deepseek)
 
 
 # ── The opencode driver seams ──
@@ -760,6 +765,7 @@ class TestEndpointPayloadShape:
         assert [r["policy_id"] for r in rows] == [
             "claude",
             "codex",
+            "deepseek",
             "kas",
             "kiro",
             "opencode",
