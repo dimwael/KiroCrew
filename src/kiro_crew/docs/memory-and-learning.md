@@ -136,6 +136,27 @@ Kiro Crew automatically consolidates conversations into memory:
 
 No manual action needed — it happens in the background.
 
+### Which transcripts consolidate
+
+Every consolidation pass — the message-count threshold, the idle sweep, the
+dashboard trigger and `kirocrew consolidate` — goes through one choke point
+that reads the transcript's slot-owned metadata header before it snapshots
+any messages. The header decides one of three outcomes:
+
+- **Local** — no privacy marker; the pass runs as described above.
+- **Private** — `executor` is `remote` (the transcript mirrors another
+  crew's conversation) or `memory_mode` is Incognito or Temporary. The pass
+  is skipped permanently: nothing is distilled, and nothing is written to
+  memory. An absent or unrecognized value reads as local.
+- **Unknown** — the header cannot be read. No pass runs and the transcript
+  stays pending, so a later pass retries instead of treating it as local.
+  The CLI prints `skipped (retryable; no consolidation pass ran)`.
+
+Only the current header is consulted. Both markers are slot-owned, so a slot
+that unbinds from its peer clears `executor` and its already-mirrored rows
+read as local on the next pass; fencing those pre-unbind rows is the unbind
+path's responsibility, not this guard's.
+
 ## Reading Memory Programmatically
 
 The markdown layer is readable through the CLI, so consumers depend on an
