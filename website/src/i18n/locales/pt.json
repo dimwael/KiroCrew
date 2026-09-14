@@ -6424,6 +6424,9 @@
       "search_failed": "Não foi possível pesquisar arquivos. Tente novamente."
     },
     "fileRenderers": {
+      "binary_file_download_hint": "Não é texto, então não há nada para mostrar aqui. Baixe uma cópia para abri-lo em outro aplicativo.",
+      "binary_file_open_hint": "Não é texto, então não há nada para mostrar aqui. Abra-o no aplicativo correspondente ou baixe uma cópia.",
+      "binary_file_title": "Não é possível pré-visualizar este arquivo",
       "download": "Baixar",
       "download_file": "Baixar {{filename}}",
       "empty_file": "Arquivo vazio",
@@ -6880,6 +6883,7 @@
       "adding": "Adicionando…",
       "adding_2": "Adicionando...",
       "already_in_library": "Já está na Biblioteca",
+      "binary_file_cannot_be_added": "Este arquivo não é texto, portanto não pode ser adicionado aos artefatos.",
       "cancel": "Cancelar",
       "cancel_discard_unsaved_edits": "Cancelar — descartar edições não salvas",
       "cannot_read_file": "Não é possível ler o arquivo",
@@ -9851,6 +9855,7 @@
         "dock_bottom": "Fixar o painel abaixo do chat",
         "dock_right": "Fixar o painel à direita",
         "hide_line_numbers": "Ocultar números de linha",
+        "hydration_failed": "Não foi possível ler este arquivo",
         "menu_artifacts": "Artefatos",
         "menu_artifacts_desc": "Documentos e favoritos da sessão",
         "menu_browser": "Navegador",
@@ -9886,6 +9891,7 @@
         "open_side_panel_tab": "Abrir aba do painel lateral",
         "pick_a_panel_to_view": "Escolha um painel para visualizar",
         "resize_panel": "Redimensionar painel",
+        "retry": "Tentar novamente",
         "show_line_numbers": "Mostrar números de linha",
         "switch_to_split_view": "Alternar para a visualização dividida",
         "switch_to_unified_view": "Alternar para a visualização unificada",

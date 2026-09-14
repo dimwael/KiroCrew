@@ -35,6 +35,8 @@ import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator
 } from '../../components/ui/dropdown-menu'
 import { safeSetItem } from '../../utils/safeStorage'
+import { ContentSkeleton, Btn } from '../../components/ui'
+import { readFile } from '../../utils/fileReadQuery'
 import { useAppSelector } from '../../store'
 import { selectSlotSubagents, selectSlotToolLog } from '../../store/chatSlice'
 import { mcpAppKey } from '../../store/chatSlice'
@@ -1031,7 +1033,7 @@ export default function SidePanel({
                 slot={slot}
                 onClose={() => handleCloseTab(t.id)}
                 onContentChange={(c) => patchTab(t.id, { content: c })}
-                onDiskContent={(c) => patchTab(t.id, { content: c, savedContent: c })}
+                onDiskContent={(c, binary) => patchTab(t.id, { content: c, savedContent: c, ...(binary === undefined ? {} : { binary }) })}
                 onDiffModeChange={(diffMode) => patchTab(t.id, { diffMode })}
                 onRevealConsumed={() => patchTab(t.id, { revealLine: undefined })}
                 onPathChange={(p) => patchTab(t.id, { path: p, title: p.replace(/\/+$/, '').split('/').pop() || p })}
@@ -1191,7 +1193,7 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
   onContentChange: (c: string) => void
   /** Disk-originated content (file watch / Refresh): the panel routes it here
    *  so the tab's saved baseline moves with the buffer it just replaced. */
-  onDiskContent: (c: string) => void
+  onDiskContent: (c: string, binary?: boolean) => void
   onDiffModeChange: (diffMode: boolean) => void
   onFileSave: (fp: string, c: string) => Promise<void>
   onFileOpen?: (p: string, opts?: { diffMode?: boolean; replaceId?: string; canReplace?: () => boolean }) => void
@@ -1215,6 +1217,7 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
       active={active}
       filePath={tab.path || ''}
       content={tab.content || ''}
+      binary={tab.binary}
       scrollMemoryKey={scrollMemoryKey}
       onContentChange={onContentChange}
       onDiskContent={onDiskContent}
@@ -1253,6 +1256,75 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
   )
 }
 
+/**
+ * The cold-file-tab placeholder that hydrates itself.
+ *
+ * Hydration lives HERE, in the placeholder, and not in one page's effect, for
+ * a concrete reason: every host that mounts `SidePanel` and restores a file tab
+ * -- the chat page, the members page, any future one -- renders through this
+ * one component. Reading here is therefore what makes a restored tab hydrate on
+ * every such page, rather than only on the single page that happened to own the
+ * read. The read is arbitrated by `readFile`, so it shares one per-path order
+ * with chip clicks and the open panel's refresh and an older read can never
+ * land over newer bytes; `onDiskContent` (wired by the panel) patches the tab's
+ * buffer, saved baseline and type verdict, which swaps this placeholder for the
+ * editor.
+ *
+ * A failed read is shown AS a failure in the tab, with a Retry button, rather
+ * than left on the skeleton: a skeleton that never resolves reads as "still
+ * loading", so an endless one is a failure dressed as loading with no way out.
+ */
+function HydratingFileTab({ path, onDiskContent }: { path: string; onDiskContent: (c: string, binary?: boolean) => void }) {
+  const [error, setError] = useState<string | null>(null)
+  // Bumped by Retry to re-run the read; a dependency of the effect below.
+  const [nonce, setNonce] = useState(0)
+  // Kept in a ref so a new `onDiskContent` identity from the parent's render
+  // does not, by itself, re-trigger the read (which would abort and refetch on
+  // every parent render). Only `path` and a Retry change the read.
+  const onDiskContentRef = useRef(onDiskContent)
+  useEffect(() => { onDiskContentRef.current = onDiskContent })
+  useEffect(() => {
+    const controller = new AbortController()
+    setError(null)
+    void readFile(path, controller.signal).then(r => {
+      // `superseded` means this read was withdrawn (unmount / path change) or
+      // overtaken by a newer read that already answered: apply nothing.
+      if (r.kind === 'superseded') return
+      if (r.kind === 'ok') { onDiskContentRef.current(r.text, r.binary); return }
+      if (r.status === 404) {
+        // The same placeholder sentence `openFile` writes for a moved/deleted
+        // file, so the tab opens on that text instead of staying cold.
+        onDiskContentRef.current(i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or'), false)
+        return
+      }
+      const reason = r.status
+        ? i18nT('pages.chatPage.http_status', { status: r.status })
+        : errMessage(r.error) || i18nT('pages.chatPage.unknown_error')
+      setError(reason)
+    })
+    return () => controller.abort()
+  }, [path, nonce])
+  if (error !== null) {
+    return (
+      <div data-testid="file-tab-hydration-failed" className="h-full p-4 flex flex-col items-start gap-3">
+        {/* The failure goes through ErrorNotice so it carries the same structured
+            context and agent hand-off as every other surfaced error; the reason
+            is the notice's own message, never interpolated into copy. */}
+        <ErrorNotice
+          title={i18nT('pages.chat.sidePanel.hydration_failed')}
+          message={error}
+          askAgent
+          testId="file-tab-hydration-error"
+        />
+        {/* Retry is the primary action: it is the one that resolves THIS state.
+            The notice's own "Ask the agent" is the escalation, so it stays secondary. */}
+        <Btn primary onClick={() => { setError(null); setNonce(n => n + 1) }}>{i18nT('pages.chat.sidePanel.retry')}</Btn>
+      </div>
+    )
+  }
+  return <div data-testid="file-tab-hydrating" className="h-full p-4"><ContentSkeleton rows={8} /></div>
+}
+
 function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDiskContent, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onAddToContext, onSubmitComments, connected = true, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
   tab: PanelTab; active: boolean; slot: string
   /** The chat's project directory — the file-browser rail's tree root. */
@@ -1261,7 +1333,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
   onContentChange: (c: string) => void
   /** Disk-originated content (file watch / Refresh): restamps the tab's saved
    *  baseline alongside the buffer, so a re-open still treats the tab clean. */
-  onDiskContent: (c: string) => void
+  onDiskContent: (c: string, binary?: boolean) => void
   onDiffModeChange: (diffMode: boolean) => void
   /** Drop the tab's one-shot line-reveal target once the panel has acted on it. */
   onRevealConsumed: () => void
@@ -1290,6 +1362,13 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
   // same key.
   const scrollMemoryKey = scrollMemoryKeyFor(slot, tab.id)
   if (tab.kind === 'file') {
+    // A restored file tab carries only metadata -- its bytes were stripped on
+    // persist -- so nothing about it is known until a read lands. The tab
+    // hydrates ITSELF (see `HydratingFileTab`) rather than leaning on a
+    // per-page effect, so it comes to life on every host that mounts the panel.
+    if (tab.content === undefined) {
+      return <HydratingFileTab path={tab.path || ''} onDiskContent={onDiskContent} />
+    }
     return (
       <FileTabBody
         tab={tab}
