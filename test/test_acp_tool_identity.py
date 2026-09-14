@@ -4,8 +4,8 @@ Three landed fixes are pinned here:
 
 1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch.py``): an
    ``AcpEvent`` now carries the NON-model-authored tool identity from
-   ``_meta.kiro`` — ``tool_name`` (``_kiro_tool_name``) and ``mcp_server_name``
-   (``_kiro_mcp_server_name``). A non-empty ``mcp_server_name`` is the trusted
+   ``_meta.kiro`` — ``tool_name`` (``_kiro_tool_name``) and ``mcp_server_name``.
+   A non-empty ``mcp_server_name`` is the trusted
    "this was a real MCP tool call" discriminator; both are ``""`` when the
    backend emits no ``_meta`` (fail-closed).
 
@@ -30,7 +30,7 @@ import pytest
 from chat_test_helpers import _make_state
 
 from kiro_crew import session_directive
-from kiro_crew.acp._dispatch import _build_tool_call_event, _kiro_mcp_server_name
+from kiro_crew.acp._dispatch import _build_tool_call_event
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_SUBAGENT_ACTIVITY,
@@ -42,31 +42,6 @@ from kiro_crew.acp.types import (
 )
 
 # ── Part 1: ACP identity plumbing ─────────────────────────────────────────────
-
-
-class TestKiroMcpServerName:
-    """``_kiro_mcp_server_name`` extracts the trusted MCP-server discriminator
-    from ``_meta.kiro.mcpServerName``, failing closed to ``""``."""
-
-    def test_returns_name_when_present(self) -> None:
-        update = {"_meta": {"kiro": {"mcpServerName": "kirocrew-core"}}}
-        assert _kiro_mcp_server_name(update) == "kirocrew-core"
-
-    def test_absent_meta_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"toolCallId": "tc1"}) == ""
-
-    def test_absent_key_yields_empty(self) -> None:
-        """A built-in/shell tool emits ``_meta.kiro`` without an mcpServerName."""
-        assert _kiro_mcp_server_name({"_meta": {"kiro": {"toolName": "execute_bash"}}}) == ""
-
-    def test_malformed_meta_not_dict_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"_meta": "nope"}) == ""
-
-    def test_malformed_kiro_not_dict_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"_meta": {"kiro": "nope"}}) == ""
-
-    def test_non_string_name_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"_meta": {"kiro": {"mcpServerName": 123}}}) == ""
 
 
 class TestBuildToolCallEventIdentity:
