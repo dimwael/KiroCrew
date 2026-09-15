@@ -354,6 +354,54 @@ class TestTheGenuineProtectionsSurvive:
         assert _rule_of(cmd) is None, cmd
 
 
+_READER = "from kiro_crew.config.loader import read_local_secret"
+
+
+class TestAnImportBeginsAtEveryStatementBoundary:
+    """The product-import anchor reads every place Python lets a statement start.
+
+    A simple statement begins at the start of input, after ``;``, after a newline,
+    or after the ``:`` that closes a compound header. Those four are the whole set
+    the grammar has, so the anchor is closed by construction: a ``from kiro_crew``
+    tucked behind ``if True:`` is the same import as one on its own line.
+    """
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "",
+            "x = 1; ",
+            "\n",
+            "if True: ",
+            "for _ in [0]: ",
+            "while 1: ",
+            "try: ",
+            "with open('/dev/null'): ",
+            "def f(): ",
+            "class C: ",
+            "if True:\n    ",
+            "x = 1\nif x: ",
+        ],
+    )
+    def test_every_boundary_the_grammar_has_reaches_the_import(self, prefix):
+        payload = f"{prefix}{_READER}; print(read_local_secret())"
+        assert _rule_of(f'python -c "{payload}"') == _MINT, repr(prefix)
+
+    def test_a_colon_inside_an_ordinary_expression_starts_nothing(self):
+        """Dict, slice and annotation colons are not statement boundaries.
+
+        None of these is followed by an import, so the wider class must not turn a
+        plain colon into a reason: the anchor still needs the import itself.
+        """
+        for payload in (
+            "d = {'kiro_crew': 1}; print(d)",
+            "s = 'kiro_crew token'[0:4]; print(s)",
+            "x: int = 1; print('kiro_crew', x)",
+            "print({'a': 'from kiro_crew.acp import client'})",
+        ):
+            assert _rule_of(f'python -c "{payload}"') is None, payload
+
+
 def _split(text: str, size: int) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), size)]
 

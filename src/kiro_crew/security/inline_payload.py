@@ -38,8 +38,11 @@ _MINT_SURFACE_RE = re.compile(
     r"|kiro_crew[\w./]*token(?!iz)"
     r"|from\s+kiro_crew\s+import\b[^;]{0,120}?(?<![a-z0-9_.-])(?:cli|cli_server|__main__|_bootstrap)(?![a-z0-9_])"
 )
+# A simple statement begins at the start of input, after ``;``, after a newline,
+# or after the ``:`` that closes a compound header (``if x:``, ``for``, ``try:``,
+# ``def f():``). Python's grammar has exactly those four, so the class is closed.
 _PRODUCT_IMPORT_RE = re.compile(
-    r"(?:^|[;\n])\s*(?:from\s+kiro_crew(?:\.[\w.]*)?\s+import\b"
+    r"(?:^|[;\n:])\s*(?:from\s+kiro_crew(?:\.[\w.]*)?\s+import\b"
     r"|import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*kiro_crew\b)"
 )
 # Only consulted INSIDE a loader argument, never beside an unrelated loader.
