@@ -15,7 +15,9 @@ import mimetypes
 import ntpath
 import os
 import posixpath
+import queue
 import re
+import shutil
 import stat as _stat_mod
 import subprocess
 import sys
@@ -24,8 +26,9 @@ import time
 import urllib.parse
 import uuid
 import zipfile
+from collections import OrderedDict
 from dataclasses import asdict
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import BinaryIO, Callable, NamedTuple, TypeVar
 
 from aiohttp import web
@@ -72,18 +75,26 @@ from kiro_crew.dashboard.state import (
     append_and_surface,
 )
 from kiro_crew.doc_parser import extract_text
+from kiro_crew.github_runner import validate_provider_executable
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
+from kiro_crew.platform.context import redact_log_via_context
+from kiro_crew.sandbox import (
+    cgroup_scope_argv,
+    popen_limited,
+    sandboxed_spawn_argv,
+    wrap_argv,
+)
 from kiro_crew.security import (
     BINARY_MIME_ALLOWLIST,
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
     redact_path_segments,
+    sensitive_home_dirs,
 )
 from kiro_crew.slack.handler import is_tracked_channel
 from kiro_crew.validation import (
@@ -92,7 +103,10 @@ from kiro_crew.validation import (
     ValidationError,
     validate_tool_args,
 )
-from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory_bytes
+from kiro_crew.zip_vet import (
+    ZipInventoryRejected,
+    vet_zip_inventory_bytes,
+)
 
 # Register OOXML office MIME types explicitly. The system mimetypes
 # database on AL2/AL2023 build hosts does NOT include .docx, .xlsx, or
@@ -517,10 +531,10 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
         # extra credential regexes scrub the broadcast file JSON too — the
         # same overlay-aware pass the filename/path/description gates use.
         redacted_file_json = redact(json.dumps(file_data))
-        # append_and_surface, not a hand-built broadcast_ws: hand-built
-        # frames ship the row a second time and carry no ``meta.mid``, so
-        # the client cannot recognise the redelivery and renders a
-        # duplicate card.
+        # append_and_surface = the same conditional-broadcast pattern this
+        # site pioneered, now also stamping ``ts`` + ``meta.mid`` on the
+        # reader-suppressed frame so a client seeing the row through two
+        # doors recognises it instead of rendering a duplicate card.
         append_and_surface(state, active, "file", redacted_file_json)
     else:
         # Suppression is the RIGHT outcome — better nowhere than in an unrelated
@@ -4262,6 +4276,1107 @@ async def api_file_search(request: web.Request) -> web.Response:
     })
 
 
+# ── Content search (/api/file-grep) ───────────────────────────────────────────
+#
+# The side-panel Files rail's Content mode. Filename search is
+# ``api_file_search`` above; this endpoint answers "which files CONTAIN this
+# text", which the dashboard had no way to ask. The Files app's own search
+# (``apps/builtins/file_explorer/server.py``) solves the same problem in a
+# separate process with its own allow-root model; the shape of the answer is
+# shared with it deliberately (``file``/``line``/``col``/``preview``) so the two
+# result lists render the same way, but nothing is shared at runtime: gating
+# here goes through this module's own ``_validate_dashboard_path`` /
+# ``is_sensitive_path`` chokepoint, like every other handler in this file.
+
+#: Wall-clock budget for ONE request, shared by the text pass and the document
+#: pass. The rail queries on a keystroke debounce, so the endpoint is built to
+#: answer fast and SAY it was capped rather than to be exhaustive -- a partial
+#: list arriving while the user is still typing beats a complete one arriving
+#: after they gave up. ``truncated`` in the response is what the status line
+#: reads.
+_GREP_TIME_BUDGET_SECS = 2.0
+#: Ceiling on returned hits. Both engines report at most one hit per file, so
+#: this also bounds how many distinct files a response can name.
+_GREP_MAX_RESULTS = 200
+#: Per-file read ceiling for the python fallback. Bounds one file's contribution
+#: to memory and scan time; ripgrep applies its own binary/size heuristics.
+_GREP_MAX_FILE_BYTES = 2 * 1024 * 1024
+#: Preview length, matching the Files app's search rows.
+_GREP_PREVIEW_CHARS = 400
+#: A location label is a few words ("Costs row 12"), but a workbook's sheet
+#: title is author-controlled text of any length, so it is bounded like the
+#: preview rather than trusted to be short.
+_GREP_LABEL_CHARS = 120
+#: A one-character query matches nearly every file, which is not a search result
+#: -- it is a whole-tree read. Same floor ``api_file_search`` applies.
+_GREP_MIN_QUERY_CHARS = 2
+#: Longest accepted query. A pathological literal costs the scan, not the match.
+_GREP_MAX_QUERY_CHARS = 200
+#: Directories either pass may descend into. Bounds traversal the way
+#: ``_WALK_MAX_DIRS_VISITED`` does for the filename walk -- the deadline alone
+#: does not, because a tree of empty directories advances the walk without ever
+#: reading a file, and a deadline that has not expired is not a bound.
+_GREP_MAX_DIRS_VISITED = 20_000
+
+#: Formats the document pass extracts text from. Every one of them is a
+#: container whose bytes hold no searchable plain text, so the text pass skips
+#: them and this pass owns them exclusively -- neither engine can report the
+#: same file twice.
+#: Containers the document pass extracts. ``.pdf`` is deliberately ABSENT:
+#: extracting its text has no memory ceiling this process can enforce
+#: (``pdfplumber`` exposes no length limit, and the allocation is the parsed
+#: character list itself, so any check runs after the memory is committed).
+#: Without the extension a PDF is simply not a document to this pass, and both
+#: engines then skip it as binary -- ripgrep by its own binary detection, the
+#: python walk by its NUL sniff. Restoring it needs a resource-bounded
+#: extractor, which belongs with the identical exposure in
+#: ``knowledge/readers.py`` rather than here.
+_GREP_DOC_EXTS = frozenset({".docx", ".pptx", ".xlsx"})
+#: Largest document the pass will open. Extraction is CPU-bound parsing rather
+#: than a scan, so the ceiling is about parse cost, not read cost.
+_GREP_DOC_MAX_BYTES = 25 * 1024 * 1024
+#: Aggregate extracted text per document, handed to ``extract_text``'s own
+#: ``max_chars`` so a container with thousands of parts stops early.
+_GREP_DOC_MAX_CHARS = 400_000
+#: How often the worksheet row loop reads the clock. Every row would be pure
+#: overhead on a legitimate large sheet; a stride bounds the overshoot to a
+#: fixed number of rows rather than to the file's size, which is the property
+#: that matters -- an empty row produces no text, so the character cap cannot
+#: see it and only the deadline can.
+_GREP_ROW_DEADLINE_STRIDE = 512
+#: How long teardown waits for the reader thread and the killed child. Short:
+#: both are being torn down, and a search must not hold a transfer-pool worker
+#: waiting on either.
+_GREP_RG_TEARDOWN_SECS = 2.0
+#: How long the record loop may block on one ``get`` before it re-checks the
+#: deadline and whether the reader has died. Bounds only the lag in noticing a
+#: FINISHED search whose end-of-stream sentinel was dropped on a full queue;
+#: the search's own budget is the deadline, not this.
+_GREP_RG_POLL_SECS = 0.05
+
+#: Stands in for a record too large to queue. ``rg --json`` emits one JSON object
+#: per line, so a real record always starts with ``{``; a NUL-led string cannot be
+#: one, which keeps the hand-off queue typed as the strings it carries.
+_GREP_RG_OVERSIZE = "\0oversize"
+
+#: Lines held between the rg reader thread and the parse loop. Small on purpose:
+#: it is a hand-off buffer, not a place to accumulate output -- the reader blocks
+#: on a full queue, so a fast rg cannot outrun the deadline check by buffering
+#: ahead of it.
+_GREP_RG_QUEUE_LINES = 64
+
+#: Largest ``rg --json`` record the reader will queue. The COUNT of records is
+#: bounded above, but not their size: ``--max-count 1`` bounds records per FILE
+#: and ``--max-filesize`` bounds a file at 2 MB, so a matching line inside a
+#: minified blob is a single multi-megabyte record and a full queue of those is
+#: hundreds of MB on the gateway. A record past this is skipped and marks the
+#: answer short: its ``_GREP_PREVIEW_CHARS`` preview would carry nothing a reader
+#: can act on, and together the two bounds make resident memory
+#: LINES x RECORD_BYTES rather than LINES x file-size.
+_GREP_RG_MAX_RECORD_BYTES = 64 * 1024
+
+#: Documents whose extracted text is remembered, keyed by a digest of the bytes
+#: the text was extracted from, so an edited document re-parses. LRU because the
+#: rail re-queries the same tree on every keystroke, and re-parsing a deck per
+#: character is the whole cost the document pass would otherwise add.
+_GREP_DOC_CACHE_ENTRIES = 64
+
+#: (extension, content digest) -> ((label, text), ...). The key is a pure function
+#: of the bytes that produced the value: both come from the one read, so a
+#: document replaced between two searches cannot be answered from the old
+#: parse -- new bytes hash to a new key and miss. Written from the transfer
+#: pool, which has several workers, so every read and write holds the lock.
+_GREP_DOC_CACHE: "OrderedDict[tuple[str, bytes], tuple[tuple[str, str], ...]]" = (
+    OrderedDict()
+)
+_GREP_DOC_CACHE_LOCK = threading.Lock()
+
+#: Header ``doc_parser._extract_pptx`` writes before each slide's text. Parsing
+#: it back is what turns one extracted blob into rows a reader can navigate.
+_GREP_PPTX_SLIDE_RE = re.compile(r"^-{3}\s*Slide\s+(\d+)\s*-{3}$")
+
+
+def _grep_doc_cache_get(key: tuple[str, bytes]) -> tuple[tuple[str, str], ...] | None:
+    with _GREP_DOC_CACHE_LOCK:
+        hit = _GREP_DOC_CACHE.get(key)
+        if hit is not None:
+            _GREP_DOC_CACHE.move_to_end(key)
+        return hit
+
+
+def _grep_doc_cache_put(
+    key: tuple[str, bytes], segments: tuple[tuple[str, str], ...]
+) -> None:
+    with _GREP_DOC_CACHE_LOCK:
+        _GREP_DOC_CACHE[key] = segments
+        _GREP_DOC_CACHE.move_to_end(key)
+        while len(_GREP_DOC_CACHE) > _GREP_DOC_CACHE_ENTRIES:
+            _GREP_DOC_CACHE.popitem(last=False)
+
+
+def _grep_resolve_root(raw: str) -> tuple[str, bool]:
+    """Validate and canonicalize the search root; say whether it is a directory.
+
+    Blocking (``validate_file_path``'s ``realpath`` plus, on Windows, an ancestor
+    ``lstat`` walk, then ``isdir``, then the sensitive-path fence) -- reached only
+    through :func:`_run_path_probe`.
+
+    An empty return path means the root is REFUSED, and it deliberately conflates
+    two reasons: the shared validator rejected the name, or the canonical path is
+    a credential store. The endpoint answers both with the same 403, so nothing
+    downstream needs to tell them apart, and collapsing them here is what lets the
+    fence run off the loop.
+
+    ``is_sensitive_path`` belongs on this side of the boundary because it is
+    filesystem work whose NAME does not look like it: one call resolves the path
+    and walks its ancestors, which measures in the tens of syscalls (72 ``lstat``,
+    8 ``realpath``, 6 ``readlink`` for one ordinary path here). Run from the
+    coroutine it parks the gateway's only event loop on whatever mount the caller
+    named -- the same hazard the off-loop ratchet already records for
+    ``shutil.which``.
+
+    Both 403s are answered rather than a 404: the caller named something it may
+    not name, and "not found" would invite it to probe for the spelling that is
+    allowed.
+    """
+    validated = _validate_dashboard_path(raw)
+    if validated is None:
+        return "", False
+    root = os.path.realpath(os.path.expanduser(validated))
+    if is_sensitive_path(root):
+        return "", False
+    return root, os.path.isdir(root)
+
+
+def _grep_sensitive_globs(root: str) -> list[str]:
+    """ripgrep exclusions for the credential stores ``is_sensitive_path`` fences.
+
+    DERIVED from :func:`kiro_crew.security.sensitive_home_dirs`, never a second
+    hand-kept list: this is an optimisation (do not read those bytes at all) and
+    the authority stays the per-hit ``is_sensitive_path`` filter both engines
+    apply. A copy here would be the thing that silently stops matching the fence.
+
+    Anchored under *root*, and that is what keeps the optimisation from becoming a
+    DIVERGENCE. ``is_sensitive_path`` is HOME-anchored: ``~/.npmrc`` is a
+    credential store, a project's own ``.npmrc`` is an ordinary file, and the
+    python walk searches the latter. An unanchored ``!**/.npmrc`` excluded it at
+    any depth, so the same query answered differently depending on whether the
+    host had ripgrep -- with the rg host quietly returning less. Each entry is
+    therefore resolved to its absolute home path and emitted only when it truly
+    lies inside the tree being searched, as a root-ANCHORED glob -- with the
+    leading slash gitignore semantics require, since a slash-less pattern matches a
+    basename at any depth and would be exactly the unanchored rule this replaces. A
+    root outside HOME emits nothing and loses nothing: there is no credential store
+    under it for the glob to have saved a read on.
+
+    ``--iglob``, not ``--glob``: ripgrep matches globs case-sensitively, so
+    ``!.aws`` leaves ``.AWS`` searchable -- the same directory on a
+    case-insensitive volume, and a content search returns the bytes themselves.
+    """
+    args: list[str] = []
+    home = os.path.expanduser("~")
+    root_real = os.path.realpath(root)
+    for entry in sensitive_home_dirs():
+        relative = entry.strip("/")
+        if not relative:
+            continue
+        absolute = os.path.realpath(os.path.join(home, relative))
+        try:
+            inside = os.path.relpath(absolute, root_real)
+        except ValueError:
+            # Different drives on Windows -- not inside, by definition.
+            continue
+        if inside == os.curdir or inside.startswith(os.pardir):
+            continue
+        # A LEADING slash is what anchors. ripgrep follows gitignore semantics,
+        # under which a pattern with no slash matches a BASENAME at any depth: bare
+        # `!.ssh` would hide every `.ssh` in the tree, which is the unanchored
+        # behaviour this function exists to stop, and searching the PARENT of a home
+        # directory would hide a project's `.ssh` several levels down. Forward
+        # slashes on every platform, because a Windows `relpath` yields backslashes
+        # and ripgrep does not read those as separators.
+        args += ["--iglob", "!/" + PurePath(inside).as_posix()]
+    return args
+
+
+def _grep_hit(path: str, line: int, preview: str, label: str = "") -> dict:
+    """One result row.
+
+    ``label`` is absent for a text hit and names the location INSIDE a document
+    otherwise, because none of the document formats has a line to jump to.
+
+    Deliberately no column. The rail highlights the match by finding it in
+    ``preview`` itself, so a column would be a second, disagreeing answer to the
+    same question -- and ripgrep reports a BYTE offset where the preview is
+    decoded text, which is a correctness problem nothing was reading.
+
+    EVERY string this row carries is REDACTED here, at the one chokepoint every hit
+    passes through, text and document alike -- the preview, the location label and
+    the path. A field added later is redacted too; that is the rule, not a list.
+
+    Each of the three earns it separately. A content search returns the matching
+    LINE, so a project file with an API key on it puts that key in the response,
+    and unlike the read endpoints the user never asked for that specific file. The
+    label is document CONTENT the author chose (a workbook's is its sheet title).
+    And a PATH segment can itself be credential-shaped -- a directory or filename
+    holding a token -- which is why the listings in this module redact the paths
+    they return; a search result is no different.
+
+    The sensitive-path fence does not help with any of it: it covers credential
+    STORES, not a secret pasted into an ordinary source file or typed into a name.
+
+    Redaction runs BEFORE the truncation. On a head slice the order rarely
+    matters, but a secret that starts inside the preview and runs past
+    ``_GREP_PREVIEW_CHARS`` would be cut in half first, and half a token matches
+    no pattern -- so the cut has to come second.
+    """
+    # Both redactors answer (text, warnings); the warnings belong to a caller
+    # that reports them, and this one is building a row.
+    safe, _ = redact_credentials(preview.rstrip("\n"))
+    safe, _ = redact_exfiltration_urls(safe)
+    hit: dict = {
+        # Segment-wise, not whole-string: each redacted segment carries a label, so
+        # two different paths that both collapse to a tag stay two rows. A clean
+        # path is returned byte-for-byte, so only a credential-shaped one becomes
+        # unopenable -- which is the intent, and is what the tree and git listings
+        # in this module already do with the same helper and the same redactor.
+        "file": redact_path_segments(path, redact),
+        "line": line,
+        "preview": safe[:_GREP_PREVIEW_CHARS],
+    }
+    if label:
+        # Redaction first, then the cut: cutting first would leave an unmatchable
+        # fragment of a secret behind.
+        safe_label, _ = redact_credentials(label)
+        safe_label, _ = redact_exfiltration_urls(safe_label)
+        hit["label"] = safe_label[:_GREP_LABEL_CHARS]
+    return hit
+
+
+def _grep_rg_executable() -> str | None:
+    """The ripgrep this endpoint may run, as an absolute path, or None.
+
+    ``shutil.which`` walks ``$PATH``, and the gateway's ``$PATH`` can include
+    trees the agent itself writes -- the project checkout, the workspace root.
+    An ``rg`` planted there would run under the sandbox launcher with the
+    gateway's own environment, on the user's next keystroke.
+
+    Deciding which binaries clear that bar is not this module's job.
+    :func:`validate_provider_executable` is the repo's executable-provenance
+    chokepoint and already answers it for every CLI the gateway spawns:
+    containment in the agent-writable tree, ownership by a third account,
+    world-writability, a symlink chain, a non-regular or non-executable file, a
+    root gateway, the Windows ACL where the mode bits carry no information, and
+    the operator's ``KIROCREW_PROVIDER_BIN_STRICT`` escalation. Spelling a
+    subset of that here is what left the parent chain unchecked: a 0755 ``rg``
+    inside a 0777 non-sticky directory cleared a world-writable test applied
+    only to the binary, and anyone on the host could replace it between two
+    keystrokes. The chokepoint walks every parent, so delegating is the fix and
+    re-spelling was the defect.
+
+    ``rg`` is a weaker case than ``gh``, never a stronger one -- it is handed no
+    provider credentials -- so the default relaxed policy applies and
+    ``require_protected`` stays unset, which keeps an ordinary user-owned
+    Homebrew or asdf install working. A refusal is not an error: the search
+    takes the python engine, which answers the same question more slowly.
+
+    Blocking (``which`` stats every ``$PATH`` entry, the provenance walk stats
+    each parent) -- only called from the transfer pool, never from the
+    coroutine.
+    """
+    found = shutil.which("rg")
+    if not found:
+        return None
+    try:
+        return validate_provider_executable(found)
+    except ValueError as exc:
+        logger.warning("file_grep: refusing rg at %s: %s", found, exc)
+        return None
+
+
+def _grep_rg_argv(root: str, executable: str = "rg") -> list[str]:
+    """The ``rg`` argv, built so ripgrep answers the SAME question the fallback does.
+
+    Three flags carry that equivalence, and each one was a divergence before it
+    was there:
+
+    ``--fixed-strings`` -- the fallback and document pass both match
+    ``re.escape(query)``, so both are LITERAL. Without ``-F``
+    ripgrep read the query as a regex: ``list[str]`` became a character class,
+    and an unbalanced ``config(`` was a parse error rather than a search.
+
+    ``--ignore-case`` rather than ``--smart-case`` -- both python passes use
+    ``re.IGNORECASE``, unconditionally.
+    Under ``--smart-case`` a query carrying one capital became case-SENSITIVE
+    for text files while the document pass still matched it, so one response
+    disagreed with itself.
+
+    ``--no-ignore`` -- ripgrep honours ``.gitignore``, ``.ignore`` and
+    ``.rgignore`` by default and the fallback's ``os.walk`` cannot, so an
+    ignored file matched without ripgrep and was invisible with it. The noisy
+    directories
+    are pruned by ``_WALK_SKIP_DIRS`` on BOTH sides instead, which is the half
+    of the ignore semantics the two engines can actually agree on.
+
+    ``--max-count 1`` is the fourth: the fallback reports the first hit per file
+    (the rail lists files, not occurrences). And ``--max-filesize`` is the
+    fifth: the fallback skips a file over ``_GREP_MAX_FILE_BYTES`` outright, so
+    ripgrep must skip it too rather than scan it to EOF and report a match the
+    other host never sees.
+
+    *executable* is the absolute path :func:`_grep_rg_executable` vetted, so the
+    spawn runs the checked file; the bare name is only a default for tests.
+    """
+    cmd = [
+        executable,
+        # rg reads flags from the file RIPGREP_CONFIG_PATH names, and one of the
+        # flags it accepts is `--pre=<binary>`, which runs an arbitrary
+        # executable -- so a search would execute whatever that file said. The
+        # child inherits this process's environment and the sandbox does not
+        # scrub that variable, so this flag is the fence. It also protects the
+        # equivalent-answer contract below: a config file can add `--smart-case`
+        # or a glob and make rg answer a different question than the fallback.
+        "--no-config",
+        "--json",
+        "--fixed-strings",
+        "--ignore-case",
+        "--no-ignore",
+        "--max-count", "1",
+        "--max-filesize", str(_GREP_MAX_FILE_BYTES),
+        "--no-messages",
+        "--hidden",
+    ]
+    for ignored in sorted(_WALK_SKIP_DIRS):
+        cmd += ["--glob", f"!**/{ignored}"]
+    # Containers the document pass owns. Excluded here so one .docx cannot be
+    # reported twice -- once as an unreadable blob by ripgrep's binary
+    # heuristics and once with a real location by the pass below.
+    #
+    # ``--iglob``, because the pass that owns them matches
+    # ``splitext(name)[1].lower()`` and so claims ``REPORT.DOCX`` as readily as
+    # ``report.docx``. Case-sensitive ``--glob`` does not exclude that spelling:
+    # ripgrep reads it as a binary blob and the file comes back TWICE -- once
+    # positionless from here and once with a page from the document pass. The
+    # same reasoning governs :func:`_grep_sensitive_globs` one function below.
+    #
+    # The ``_WALK_SKIP_DIRS`` loop above stays case-SENSITIVE deliberately, and
+    # the asymmetry is the parity contract rather than an oversight: the python
+    # walk screens directories by exact name (``d not in _WALK_SKIP_DIRS``), so
+    # ``--iglob`` there would make ripgrep skip a ``Node_Modules`` the fallback
+    # still descends into -- one engine answering a different question, which is
+    # the whole failure this argv exists to prevent. Extensions are folded on
+    # both sides; directory names are folded on neither.
+    for ext in sorted(_GREP_DOC_EXTS):
+        cmd += ["--iglob", f"!**/*{ext}"]
+    cmd += _grep_sensitive_globs(root)
+    # The query is NOT here. A child's arguments are world-readable through
+    # `/proc/<pid>/cmdline` and `ps`, and this handler already treats the query as
+    # secret-class text -- it redacts it before every SEL write, because "find
+    # which file holds this key" is an ordinary reason to type a credential into a
+    # search box. Publishing it to every account on the host for the life of the
+    # process contradicted that. `--file -` reads the pattern list from stdin, so
+    # the argv carries the root and the flags only.
+    #
+    # It also retires the argument-terminator concern by construction: a query
+    # starting with `-` cannot be read as a flag when it is not on the command
+    # line at all.
+    cmd += ["--file", "-"]
+    # Every glob above is NEGATED, which is load-bearing: one non-negated glob
+    # flips ripgrep's whole glob set into allowlist mode and would silently
+    # exclude every file the set does not name.
+    cmd += ["--", root]
+    return cmd
+
+
+def _grep_rg_teardown(
+    proc: "subprocess.Popen[str]",
+    reader: "threading.Thread | None",
+    lines: "queue.Queue[str | None] | None",
+) -> None:
+    """Stop the child and let the reader thread finish, on every exit path.
+
+    Two things a capped search must not leave behind. A killed child that is
+    never waited on stays a zombie for the life of the gateway, and one search
+    runs per keystroke. And the reader blocks on a FULL queue -- once this side
+    stops consuming, its ``put`` never returns, including the sentinel ``put`` in
+    its own ``finally``, so the thread wedges rather than exiting.
+
+    Closing the pipe ends the reader's iteration; draining lets a waiting ``put``
+    proceed. Both are needed -- closing alone leaves a thread already blocked
+    inside ``put`` exactly where it was.
+    """
+    if proc.poll() is None:
+        try:
+            platform_compat.kill_process_tree(proc.pid)
+        except (ProcessLookupError, OSError):
+            # The child can exit between the poll and the signal, and
+            # kill_process_tree deliberately lets that propagate. This runs in a
+            # `finally`, where a raise would replace a completed search's answer
+            # with a 500 -- so a process that is already gone is simply gone.
+            pass
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    if reader is not None and lines is not None:
+        limit = time.monotonic() + _GREP_RG_TEARDOWN_SECS
+        while reader.is_alive() and time.monotonic() < limit:
+            try:
+                lines.get_nowait()
+            except queue.Empty:
+                reader.join(0.02)
+        if reader.is_alive():
+            logger.warning("file_grep: rg reader thread did not exit")
+    try:
+        proc.wait(timeout=_GREP_RG_TEARDOWN_SECS)
+    except subprocess.TimeoutExpired:
+        logger.warning("file_grep: rg did not exit after kill; not reaped")
+    except (ProcessLookupError, OSError):
+        # Already reaped, or unreapable. Nothing to do, and raising here would
+        # cost the caller its answer.
+        pass
+
+
+def _grep_rg_hit_of(record_line: str) -> dict | None:
+    """One ``rg --json`` line as a hit, or None when it is not a reportable match.
+
+    The single place a record becomes a hit, so the streaming reader and the
+    whole-blob parser cannot drift into two different ideas of what counts.
+    """
+    try:
+        record = json.loads(record_line)
+    except ValueError:
+        return None
+    if record.get("type") != "match":
+        return None
+    data = record.get("data") or {}
+    path = (data.get("path") or {}).get("text") or ""
+    # The authoritative gate; the argv's globs only keep ripgrep from
+    # reading these in the first place.
+    if not path or is_sensitive_path(path):
+        return None
+    text = (data.get("lines") or {}).get("text") or ""
+    return _grep_hit(path, int(data.get("line_number", 0)), text)
+
+
+def _grep_rg(root: str, query: str, deadline: float) -> tuple[list[dict], bool] | None:
+    """Text pass through ``rg --json``, or None when ripgrep produced no verdict.
+
+    None (rather than an empty list) is the "fall back to python" signal: a
+    missing binary, a failed spawn and an ERROR exit are all "no verdict", and
+    reporting them as an empty list would tell the user "no matches" about a
+    search that never ran. ripgrep exits 0 with matches, 1 with none, and >1 on
+    an error, so only the last of those three takes the fallback.
+
+    A TIMEOUT is deliberately NOT a fallback: the deadline is shared, so the
+    python pass would start with nothing left and return an empty list at its
+    first check. The partial hits ripgrep already printed are returned instead,
+    marked truncated -- a short answer that says it is short, which is the whole
+    budget contract.
+
+    Records are read INCREMENTALLY and the child is stopped at
+    ``_GREP_MAX_RESULTS``. Buffering the whole output first would bound resident
+    memory only by how many files in the tree match: ``--max-count 1`` bounds
+    records per FILE and ``--max-filesize`` bounds one record, but neither bounds
+    the COUNT, so a broad query on a large workspace buffered thousands of
+    records to keep 200. Streaming also makes the partial-on-timeout answer fall
+    out by construction -- it is whatever the loop has parsed -- rather than
+    decoding a ``TimeoutExpired.stdout`` whose type varies under ``text=True``.
+    """
+    executable = _grep_rg_executable()
+    if executable is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return [], True
+    out: list[dict] = []
+    cleanup: str | None = None
+    proc: "subprocess.Popen[str] | None" = None
+    reader: "threading.Thread | None" = None
+    lines: "queue.Queue[str | None] | None" = None
+    oversize = 0
+    try:
+        wrapped, cleanup = wrap_argv(_grep_rg_argv(root, executable))
+        proc = popen_limited(
+            cgroup_scope_argv(wrapped),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            # ``rg --json`` is UTF-8 by definition; decoding it with the host
+            # locale corrupts both the path and the preview inside each record,
+            # and an undecodable byte raises where nothing catches it.
+            encoding="utf-8",
+            errors="replace",
+        )
+        # Hand the pattern over the pipe rather than on the command line. One
+        # write and a close cannot block: the query is capped at
+        # ``_GREP_MAX_QUERY_CHARS`` characters, far inside a pipe buffer, and rg
+        # begins searching at EOF. The handler refuses a query containing a
+        # newline, which is what keeps this equivalent to the fallback -- ``--file``
+        # is line-delimited, so a two-line pattern file would be two patterns
+        # OR-ed together where the python pass matches one literal.
+        if proc.stdin is not None:
+            try:
+                proc.stdin.write(query + "\n")
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                # rg exited before reading its patterns (a rejected flag, a
+                # refused root). The record loop below reads EOF and the
+                # error-exit branch asks for the python engine, which is the same
+                # answer this would otherwise raise into.
+                pass
+        assert proc.stdout is not None
+        # The read is on a thread because it BLOCKS: rg prints nothing for a
+        # non-matching file, so a rare-or-absent query over a large tree emits no
+        # line for its entire traversal and an inline `for line in proc.stdout`
+        # could not observe the deadline until rg chose to speak. Waiting on a
+        # queue instead makes the timeout ours. A thread (not select/poll)
+        # because select does not accept pipe handles on Windows, which this
+        # resolver supports. Daemon: if the wait gives up, the reader must not
+        # keep the interpreter alive behind it.
+        lines = queue.Queue(maxsize=_GREP_RG_QUEUE_LINES)
+        queued = lines
+        stdout = proc.stdout
+
+        def _drain() -> None:
+            try:
+                for line in stdout:
+                    if len(line) > _GREP_RG_MAX_RECORD_BYTES:
+                        # Sentinel rather than silence: the parse loop turns this
+                        # into a short answer, so an oversize record is reported
+                        # as "incomplete", never dropped without a word.
+                        queued.put(_GREP_RG_OVERSIZE)
+                        continue
+                    queued.put(line)
+            except Exception:  # the pipe closing under a kill is expected
+                pass
+            finally:
+                # Non-blocking: teardown may already have stopped consuming, and a
+                # blocking put on a full queue is how this thread wedged.
+                try:
+                    queued.put_nowait(None)
+                except queue.Full:
+                    pass
+
+        reader = threading.Thread(target=_drain, name="file-grep-rg", daemon=True)
+        reader.start()
+        capped = False
+        while True:
+            if len(out) >= _GREP_MAX_RESULTS:
+                capped = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                capped = True
+                break
+            try:
+                record_line = lines.get(timeout=min(remaining, _GREP_RG_POLL_SECS))
+            except queue.Empty:
+                # Two very different silences arrive here, and they must be
+                # told apart rather than both treated as "out of budget".
+                #
+                # The reader announces its end by putting `None`, and that put is
+                # NON-BLOCKING by necessity: a blocking one wedges the thread on a
+                # full queue. So a full queue at that instant DROPS the sentinel,
+                # and nothing retries it. A dead reader with an empty queue is
+                # therefore a COMPLETE search whose end-of-stream marker went
+                # missing -- nothing can arrive again -- and treating it as a cap
+                # would report a finished search as partial and hold the user for
+                # the rest of the budget to do it.
+                #
+                # Otherwise rg is still traversing and has not spoken yet -- the
+                # silence an inline read cannot observe at all. Go round; the
+                # `remaining <= 0` check at the top ends it, so the deadline
+                # bounds the search and this poll bounds only how long a finished
+                # one goes unnoticed.
+                if not reader.is_alive() and lines.empty():
+                    break
+                continue
+            if record_line is None:
+                break
+            if record_line == _GREP_RG_OVERSIZE:
+                oversize += 1
+                continue
+            hit = _grep_rg_hit_of(record_line)
+            if hit is not None:
+                out.append(hit)
+        if capped:
+            # Stop the child rather than draining a tree we have already answered
+            # for: the cap and the deadline both mean "no more of this is wanted".
+            # The `finally` below kills, drains and reaps.
+            return out, True
+        code = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        # The records already parsed are real; a slow root reporting "no matches"
+        # is the failure this returns instead of.
+        return out, True
+    except (OSError, ValueError, subprocess.SubprocessError, RuntimeError):
+        # RuntimeError is the fail-closed sandbox refusal
+        # (``SandboxUnavailableError``): a host with no backend must take the
+        # python engine, not raise through the handler into a 500 on every
+        # keystroke. Same catch as the ``_run_git_bounded`` sibling.
+        logger.warning("file_grep: rg did not answer; falling back to python", exc_info=True)
+        return None
+    finally:
+        if proc is not None:
+            _grep_rg_teardown(proc, reader, lines)
+        if cleanup:
+            # ``wrap_argv``'s second return is a launcher temp file the CALLER
+            # owns; discarding it leaked one per search.
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
+    if code > 1:
+        logger.warning("file_grep: rg exited %s; falling back to python", code)
+        return None
+    if oversize:
+        logger.warning("file_grep: skipped %s oversize rg record(s)", oversize)
+    # An oversize record is a match this answer does not carry, so the answer is
+    # short and says so -- the same contract the cap and the deadline use.
+    return out, bool(oversize)
+
+
+def _grep_python(root: str, query: str, deadline: float) -> tuple[list[dict], bool]:
+    """Text pass without ripgrep. Same answer shape, same one-hit-per-file rule.
+
+    Two screens, with distinct jobs. The explicit ``is_sensitive_path`` call is
+    the VISIBLE one, and it is what makes the two engines symmetric: ripgrep's
+    hits are filtered by the same predicate, so "a credential store is never
+    reported" is one readable rule rather than a property of a helper's
+    internals. :func:`kiro_crew.hooks.safe_read_prefix` is the AUTHORITY behind
+    it -- it re-resolves through ``realpath``, so a symlink into a sensitive tree
+    is refused even though the link's own name looks ordinary -- and it bounds
+    the bytes read.
+    """
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    out: list[dict] = []
+    dirs_visited = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        if time.monotonic() >= deadline:
+            return out, True
+        dirs_visited += 1
+        if dirs_visited > _GREP_MAX_DIRS_VISITED:
+            return out, True
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in _WALK_SKIP_DIRS and not is_sensitive_path(os.path.join(dirpath, d))
+        ]
+        for name in sorted(filenames):
+            if len(out) >= _GREP_MAX_RESULTS:
+                return out, True
+            if time.monotonic() >= deadline:
+                return out, True
+            if os.path.splitext(name)[1].lower() in _GREP_DOC_EXTS:
+                continue  # the document pass owns these
+            full = os.path.join(dirpath, name)
+            # Skipped for the same reason ripgrep skips it: rg does not follow
+            # symlinks while traversing, so a link to a matching file is invisible
+            # to that engine, and reading it here makes one tree answer differently
+            # depending on whether the host has ripgrep. It also keeps the walk
+            # inside the root the caller named -- a link can point anywhere, and
+            # `os.walk` already declines to DESCEND into a linked directory, so
+            # this is the file-shaped half of a rule the directory half already
+            # follows.
+            if os.path.islink(full):
+                continue
+            if is_sensitive_path(full):
+                continue
+            try:
+                raw = safe_read_prefix(full, _GREP_MAX_FILE_BYTES + 1)
+            except (OSError, FileTooLargeError):
+                continue
+            if not raw or b"\x00" in raw[:SNIFF_BYTES]:
+                continue  # refused, empty, or binary
+            if len(raw) > _GREP_MAX_FILE_BYTES:
+                continue  # over the ceiling: ripgrep's --max-filesize skips it too
+            for number, line in enumerate(raw.decode("utf-8", errors="replace").splitlines(), 1):
+                if pattern.search(line):
+                    out.append(_grep_hit(full, number, line))
+                    break
+    return out, False
+
+
+def _grep_xlsx_segments(
+    data: bytes, path: str, deadline: float
+) -> tuple[tuple[tuple[str, str], ...], bool]:
+    """One workbook as ``("Sheet1 row 12", row text)`` segments.
+
+    read-only mode streams rows instead of materialising the sheet, but two gates
+    run BEFORE openpyxl sees the bytes, because openpyxl opens the container
+    itself and a crafted workbook would otherwise reach the XML parser on the
+    strength of its extension alone. ``extract_text`` performs the equivalent
+    pair for .docx/.pptx.
+
+    The shared inventory vet is the first and bounds the DECLARED member count
+    and central-directory size. It does not bound expansion, so a single
+    hugely-compressed member survives it -- hence the second gate over
+    ``infolist()``, which is the same aggregate-``file_size`` ceiling the sheet
+    endpoint applies. Neither is redundant: the first bounds the ``ZipFile``
+    construction that the second one needs.
+
+    Returns ``(segments, complete)``. Neither ceiling above bounds TIME, and the
+    character cap bounds only text that exists: a workbook of millions of EMPTY
+    rows passes the inventory vet as one small member, yields no text, never
+    reaches ``_GREP_DOC_MAX_CHARS``, and iterates every row. So the row loop also
+    watches the shared deadline, and ``complete=False`` says the segments are a
+    prefix of the document -- which is what keeps the truncated parse out of the
+    cache, where it would otherwise be served as the whole workbook to every
+    later search.
+    """
+    # The two ceilings are the sheet endpoint's own (``_SHEET_MAX_MEMBERS``,
+    # ``_SHEET_MAX_EXPANDED_BYTES``): one workbook policy for the module, not a
+    # second spelling of the same numbers that could drift from the first.
+    try:
+        vet_zip_inventory_bytes(data, max_members=_SHEET_MAX_MEMBERS)
+    except ZipInventoryRejected:
+        return (), True
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as probe:
+            if sum(i.file_size for i in probe.infolist()) > _SHEET_MAX_EXPANDED_BYTES:
+                logger.warning("file_grep: workbook %s expands too large; skipped", path)
+                return (), True
+    except (OSError, zipfile.BadZipFile):
+        return (), True
+    # Imported only once the archive has passed both ceilings: the central
+    # directory answers in microseconds, while this import costs ~100ms of parser
+    # setup, and a refusal should not pay for the thing it is refusing to run.
+    try:
+        import openpyxl
+    except ImportError:
+        return (), True
+    try:
+        book = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception:
+        logger.warning("file_grep: cannot read workbook %s", path, exc_info=True)
+        return (), True
+    segments: list[tuple[str, str]] = []
+    collected = 0
+    complete = True
+    try:
+        for sheet in book.worksheets:
+            for index, row in enumerate(sheet.iter_rows(values_only=True), 1):
+                # Checked every row, INCLUDING one that yields no text: an empty
+                # row is exactly the case the character cap cannot see, and it is
+                # the one a crafted workbook is made of. Sampled every
+                # _GREP_ROW_DEADLINE_STRIDE rows because `monotonic()` per row on a
+                # legitimate large sheet is pure overhead, while the stride still
+                # bounds the overshoot to a fixed row count rather than to the
+                # file's size.
+                if index % _GREP_ROW_DEADLINE_STRIDE == 0 and time.monotonic() >= deadline:
+                    complete = False
+                    return tuple(segments), complete
+                cells = [str(cell) for cell in row if cell is not None]
+                if not cells:
+                    continue
+                text = "\t".join(cells)
+                # A middot, because "Costs row 12" runs two facts together and
+                # reads as one uncertain phrase.
+                segments.append((f"{sheet.title} · row {index}", text))
+                collected += len(text)
+                if collected >= _GREP_DOC_MAX_CHARS:
+                    # The cap is a COMPLETE read of what this pass will ever use:
+                    # `_grep_cap_segments` would cut it here anyway, so caching it
+                    # serves every later query correctly.
+                    return tuple(segments), True
+    except Exception:
+        logger.warning("file_grep: workbook %s failed mid-read", path, exc_info=True)
+    finally:
+        book.close()
+    return tuple(segments), complete
+
+
+def _grep_doc_segments(
+    data: bytes, path: str, ext: str, deadline: float
+) -> tuple[tuple[tuple[str, str], ...], bool]:
+    """Extract already-authorized document bytes as (label, text) segments.
+
+    The label is what a row shows instead of a line number, because none of these
+    formats has one: ``slide 7`` for a deck and ``Sheet1 · row 12`` for a worksheet
+    row. A Word file gets an EMPTY label: its
+    paragraphs carry no page or section a reader could navigate to, so there is no
+    location to name, and a tag beside a ``.docx`` filename would add nothing the
+    filename has not already said.
+
+    Parsers receive only ``BytesIO`` objects, so none can reopen a path after
+    the safe-read identity check. ``.docx`` and ``.pptx`` go through
+    :func:`kiro_crew.doc_parser.extract_text`, already hardened against zip
+    bombs, oversized members and entity expansion.
+
+    Returns ``(segments, complete)``. ``complete`` is False only when the shared
+    deadline cut a parse short, which is what keeps a PREFIX of a document out of
+    the cache -- cached, it would be served to every later search as the whole
+    file. The worksheet row loop is the one this module owns and the one that
+    watches that clock, because it can iterate without producing the text the
+    character cap measures -- a sheet of empty rows yields nothing for the cap to
+    see. ``extract_text`` is a single call bounded by ``max_chars`` and by
+    doc_parser's own ceilings, so there is no loop there to interrupt.
+    """
+    if ext == ".xlsx":
+        return _grep_xlsx_segments(data, path, deadline)
+    text = extract_text(
+        path,
+        filename=os.path.basename(path),
+        max_chars=_GREP_DOC_MAX_CHARS,
+        fileobj=io.BytesIO(data),
+    )
+    # Complete by construction from here down: `extract_text` is a single call
+    # bounded by `max_chars`, so there is no loop the deadline could cut in half
+    # and no prefix that must be kept out of the cache.
+    if not text:
+        return (), True
+    if ext == ".pptx":
+        segments: list[tuple[str, str]] = []
+        for block in text.split("\n\n"):
+            head, _, body = block.partition("\n")
+            slide = _GREP_PPTX_SLIDE_RE.match(head.strip())
+            if slide and body:
+                segments.append((f"slide {slide.group(1)}", body))
+            elif block.strip():
+                segments.append(("", block))
+        return tuple(segments), True
+    # No label: a Word file has no location inside it to name, and "doc" beside a
+    # .docx filename says nothing the filename has not. The row shows no tag and
+    # the note above the list still explains that the file opens from its start.
+    return (("", text),), True
+
+
+def _grep_cap_segments(
+    segments: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    """Bound a document's extracted text to ``_GREP_DOC_MAX_CHARS`` in aggregate.
+
+    Every extractor checks its running total only AFTER appending a segment, so
+    one segment could still be a 50 MB decompressed paragraph -- and the cache
+    holds 64 documents. The ceiling is applied here, at the one place segments
+    are about to be retained, so the cache can never hold more than
+    ``64 * _GREP_DOC_MAX_CHARS`` characters whatever an extractor produced. The
+    crossing segment is cut to fit; anything after it is dropped.
+    """
+    kept: list[tuple[str, str]] = []
+    budget = _GREP_DOC_MAX_CHARS
+    for label, text in segments:
+        if budget <= 0:
+            break
+        if len(text) > budget:
+            text = text[:budget]
+        kept.append((label, text))
+        budget -= len(text)
+    return tuple(kept)
+
+
+def _grep_docs(
+    root: str, query: str, deadline: float, taken: int
+) -> tuple[list[dict], int, bool]:
+    """Document pass: (hits, documents skipped for budget, truncated).
+
+    Runs AFTER the text pass and inside the SAME deadline, so a tree of large
+    documents can never slow a plain-text search down -- at worst this pass reports
+    what it reached plus how many documents it did not. ``skipped_docs`` is what
+    the rail's status line names, so "no document matched" and "the budget ran
+    out before the documents" stay distinguishable to the user.
+
+    ``skipped_docs`` is a FLOOR, not a total: a spent deadline ends the walk
+    rather than counting its way through the rest of the tree. Continuing would
+    hold a bounded ``path_transfer_executor`` worker for up to
+    ``_GREP_MAX_DIRS_VISITED`` directories after the budget was already gone,
+    and at keystroke rate that starves the pool every other file endpoint
+    shares. ``truncated`` is what tells the caller the number is a floor.
+    """
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    out: list[dict] = []
+    skipped = 0
+    dirs_visited = 0
+    doc_truncated = False
+    for dirpath, dirnames, filenames in os.walk(root):
+        if time.monotonic() >= deadline:
+            return out, skipped + 1, True
+        dirs_visited += 1
+        if dirs_visited > _GREP_MAX_DIRS_VISITED:
+            return out, skipped, True
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in _WALK_SKIP_DIRS and not is_sensitive_path(os.path.join(dirpath, d))
+        ]
+        for name in sorted(filenames):
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in _GREP_DOC_EXTS:
+                continue
+            full = os.path.join(dirpath, name)
+            if is_sensitive_path(full):
+                continue
+            if taken + len(out) >= _GREP_MAX_RESULTS:
+                return out, skipped, True
+            if time.monotonic() >= deadline:
+                return out, skipped + 1, True
+            try:
+                data = safe_read_prefix(full, _GREP_DOC_MAX_BYTES + 1)
+            except (OSError, FileTooLargeError):
+                continue
+            if data is None:
+                continue
+            if len(data) > _GREP_DOC_MAX_BYTES:
+                skipped += 1
+                continue
+            # Keyed by the bytes just read, never by stat metadata: a key
+            # observed separately from the content has a replace window in
+            # which the old parse is stored under the new file's identity.
+            key = (ext, hashlib.blake2b(data, digest_size=16).digest())
+            segments = _grep_doc_cache_get(key)
+            if segments is None:
+                parsed, complete = _grep_doc_segments(data, full, ext, deadline)
+                segments = _grep_cap_segments(parsed)
+                if complete:
+                    _grep_doc_cache_put(key, segments)
+                else:
+                    # A parse the deadline cut short is a PREFIX of the document.
+                    # Cached, it would be served as the whole file to every later
+                    # search of this content -- including ones with budget to
+                    # spare -- and the digest key cannot tell the two apart,
+                    # because the bytes are identical. So it is used for this
+                    # answer and then dropped, and the answer says it is short.
+                    doc_truncated = True
+            for label, text in segments:
+                match = pattern.search(text)
+                if match is None:
+                    continue
+                position = match.start()
+                # One hit per document, like one hit per text file: the row names
+                # the location, and the file tab is where the rest is read.
+                line_start = text.rfind("\n", 0, position) + 1
+                line_end = text.find("\n", position)
+                preview = text[line_start:] if line_end < 0 else text[line_start:line_end]
+                out.append(_grep_hit(full, 0, preview.strip(), label=label))
+                break
+    return out, skipped, doc_truncated
+
+
+async def api_file_grep(request: web.Request) -> web.Response:
+    """GET /api/file-grep?root=&q= — content search under one directory.
+
+    The Files rail's Content mode. Answers ``{"results", "truncated", "engine",
+    "skipped_docs", "root"}``: a text pass (ripgrep where the host has it, an
+    equivalent python walk otherwise) followed by a document pass over
+    ``.docx``/``.pptx``/``.xlsx``, both inside one wall-clock budget.
+
+    Every filesystem call lives in a nested helper handed to
+    :func:`_run_path_probe`, never made here: this coroutine runs on the
+    gateway's only event loop and the root is the caller's to choose. That
+    includes naming the engine -- ``shutil.which`` stats every ``$PATH`` entry,
+    so the refusal shapes below report an empty engine rather than probing for
+    ripgrep on the loop once per keystroke. The search takes a TRANSFER slot
+    rather than a probe slot for the same reason ``api_file_search``'s walk
+    does -- it holds its worker for the length of the search, and a burst of
+    them must not queue in front of millisecond validation probes.
+    """
+    caller = request.get("user", "dashboard")
+    query = request.query.get("q", "").strip()
+    raw_root = request.query.get("root", "").strip()
+    # What the audit trail sees. The query is secret-class text -- a user
+    # grepping for a token VALUE types the token -- so it is redacted before it
+    # is written anywhere durable. Context-aware, not the baseline pass: this is
+    # a gate-side log line, so a host with a companion loaded must scan it with
+    # the companion's credential regexes rather than the weaker OSS ones. The
+    # exfiltration-URL pass is not in this chain -- it guards an egress boundary,
+    # and the bytes that leave are the previews, redacted in `_grep_hit`.
+    logged_query = redact_log_via_context(query)
+    #: The shape for a request that ran no search. ``engine`` is empty because
+    #: none did: naming one would be a guess, and finding out costs a $PATH walk
+    #: on the event loop.
+    empty: dict = {
+        "results": [],
+        "truncated": False,
+        "engine": "",
+        "skipped_docs": 0,
+        "root": "",
+    }
+    # A newline in the query joins the length bounds rather than earning a code of
+    # its own, because the answer is the same one a one-character query gets and it
+    # is the TRUE answer: both engines are line-oriented, so a pattern spanning a
+    # newline matches nothing either way. Stating it also protects the rg pattern
+    # channel, where ``--file`` would read those two lines as two patterns OR-ed
+    # together and start matching what the fallback cannot.
+    if (
+        not raw_root
+        or not _GREP_MIN_QUERY_CHARS <= len(query) <= _GREP_MAX_QUERY_CHARS
+        or "\n" in query
+        or "\r" in query
+    ):
+        return web.json_response(empty)
+
+    try:
+        root, root_is_dir = await _run_path_probe(_grep_resolve_root, raw_root)
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=raw_root, operation="file_grep", caller=caller)
+    # No `is_sensitive_path` here: the probe above already applied it, off the
+    # loop, and returns an empty root for a refused name and a credential store
+    # alike -- both of which this branch answers identically.
+    if not root:
+        _sel().log_api_access(
+            caller=caller, operation="file_grep", outcome="denied",
+            resources=raw_root, error="sensitive path",
+        )
+        return web.json_response(
+            {"error": "Access denied", "code": "sensitive_path"}, status=403
+        )
+    if not root_is_dir:
+        # Spelled out rather than spread from ``empty``: the error-code ratchet
+        # reads response bodies as literals, and a ``**`` spread is opaque to it.
+        return web.json_response(
+            {
+                "results": [],
+                "truncated": False,
+                "engine": "",
+                "skipped_docs": 0,
+                "root": "",
+                "error": "Search root is not a directory",
+                "code": "not_a_directory",
+            },
+            status=404,
+        )
+
+    def _search() -> tuple[list[dict], bool, str, int]:
+        """The whole search on one transfer worker. Blocking by construction."""
+        deadline = time.monotonic() + _GREP_TIME_BUDGET_SECS
+        attempt = _grep_rg(root, query, deadline)
+        if attempt is None:
+            engine = "python"
+            results, truncated = _grep_python(root, query, deadline)
+        else:
+            engine = "rg"
+            results, truncated = attempt
+        doc_hits, skipped, doc_truncated = _grep_docs(root, query, deadline, len(results))
+        return results + doc_hits, truncated or doc_truncated, engine, skipped
+
+    try:
+        results, truncated, engine, skipped_docs = await _run_path_probe(
+            _search, transfer=True
+        )
+    except _PathProbeBusy:
+        return _probe_busy_response(
+            resource=f"q={logged_query} root={root}", operation="file_grep", caller=caller
+        )
+
+    _sel().log_api_access(
+        caller=caller, operation="file_grep", outcome="allowed",
+        resources=(
+            f"q={logged_query} root={root} engine={engine} results={len(results)} "
+            f"truncated={truncated} skipped_docs={skipped_docs}"
+        ),
+    )
+    return web.json_response({
+        "results": results,
+        "truncated": truncated,
+        "engine": engine,
+        "skipped_docs": skipped_docs,
+        "root": root,
+    })
+
+
 async def api_file_diff(request: web.Request) -> web.Response:
     """GET /api/file-diff?path=... — returns git diff and HEAD content for a file."""
     raw_path = request.query.get("path", "").strip()
@@ -5358,6 +6473,8 @@ def _load_sheet_payload(f: BinaryIO, *, max_bytes: int) -> dict:
     a soft import: absence surfaces as ImportError from this thread and the
     handler maps it to 501.
     """
+    import io
+
     with f:
         import openpyxl  # noqa: F401  (probe here, off-loop; parse imports lazily too)
 
@@ -5431,6 +6548,7 @@ def _parse_workbook_grid(data: bytes) -> dict:
     shown instead of an empty cell. Both loads stream the same bytes, so the
     row structures are identical and can be zipped in lockstep.
     """
+    import io
     import itertools
 
     from openpyxl import load_workbook
