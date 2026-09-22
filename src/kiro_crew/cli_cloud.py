@@ -21,7 +21,7 @@ from kiro_crew.cloud import login as login_mod
 from kiro_crew.cloud import sizes, ssm, ui, wizard
 from kiro_crew.cloud.aws import AWSError, CloudActionDenied
 from kiro_crew.cloud.config import DEFAULT_REGION
-from kiro_crew.cloud.launch_state import LaunchState
+from kiro_crew.cloud.launch_state import LaunchRecordUnreadable, LaunchState
 from kiro_crew.cloud.login_target import (
     KiroLoginTarget,
     LoginTargetError,
@@ -589,6 +589,16 @@ def handle_cloud(args: argparse.Namespace) -> int:
         # Caught for the whole dispatch table rather than per verb: every verb resolves the
         # tag or the region through that read, ``launch`` re-attaches through it too, and a
         # verb added later would otherwise print a traceback until someone noticed.
+        ui.fail(str(exc))
+        return 1
+    except LaunchRecordUnreadable as exc:
+        # The launch record exists but cannot be read, refused where a verb consumes its
+        # tag (``LaunchState.load``). Falling back to the legacy pointer instead could hand
+        # ``destroy --yes`` an older stack's tag, so refusing is the safe answer -- and like
+        # the alias refusal above it describes a HOST fault (a permission mode, an I/O
+        # error) the operator fixes, so the message names the file and the next command.
+        # Caught at the dispatch table for the same reason: every verb resolves its tag or
+        # region through that one read.
         ui.fail(str(exc))
         return 1
     except CloudActionDenied as exc:

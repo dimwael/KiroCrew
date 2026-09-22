@@ -7,12 +7,16 @@ own, and an install whose pointer is still in the configuration file keeps resum
 
 from __future__ import annotations
 
+import builtins
 import json
+import os
+from pathlib import Path
 
 import pytest
 
+from kiro_crew.cloud import launch_state as launch_state_module
 from kiro_crew.cloud.config import DEFAULT_REGION, CloudConfig
-from kiro_crew.cloud.launch_state import LaunchState, state_path
+from kiro_crew.cloud.launch_state import LaunchRecordUnreadable, LaunchState, state_path
 
 
 class TestTheLaunchRecord:
@@ -90,6 +94,158 @@ class TestTheLaunchRecord:
         state = LaunchState.load(tmp_path / "nothing-here.json")
 
         assert (state.profile, state.region, state.last_tag) == ("", DEFAULT_REGION, "")
+
+
+def _deny_reads_of(monkeypatch, target: Path) -> None:
+    """Make opening *target* fail as a permission fault, leaving every other open alone.
+
+    Injected as a module global on ``launch_state``, which shadows the builtin for that
+    module only: the writer lock's own ``open`` and everything outside the module keep
+    working, so the failure is the record's and nothing else's. A real ``chmod 0`` would
+    pin the same thing on POSIX but reads through as root and does nothing on Windows;
+    this shape answers identically everywhere the suite runs.
+    """
+    real_open = builtins.open
+
+    def deny(file, *args, **kwargs):
+        if Path(file) == target:
+            raise PermissionError(13, "Permission denied", str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(launch_state_module, "open", deny, raising=False)
+
+
+class TestAnUnreadableRecordRefuses:
+    """An existing record the read cannot open must never resolve the legacy tag.
+
+    Absence and unreadability are different answers. An absent record says there is no
+    pointer here, and the legacy fallback is what keeps an old install resuming. An
+    unreadable record says there IS a pointer and nothing is known about it -- it may name
+    a newer stack than the legacy fields do -- and ``cloud destroy --yes`` deletes whatever
+    tag this read resolves, without a prompt. The only safe answer for the second state is
+    a refusal the operator can act on.
+    """
+
+    def test_an_unreadable_record_refuses_instead_of_resolving_the_legacy_tag(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        (tmp_path / "cloud.json").write_text(
+            json.dumps({"profile": "old", "region": "us-east-1", "last_tag": "kc-older"})
+        )
+        p = tmp_path / "cloud_launch_state.json"
+        p.write_text(json.dumps({"profile": "w", "region": "eu-west-1", "last_tag": "kc-newest"}))
+        _deny_reads_of(monkeypatch, p)
+
+        with pytest.raises(LaunchRecordUnreadable):
+            LaunchState.load(p)
+
+    def test_the_refusal_names_the_file_the_cause_and_the_next_command(self, tmp_path, monkeypatch):
+        """An operator can only act on a refusal that says what to do about it.
+
+        Same bar the alias refusal meets: the file, why it refused, and one command that
+        moves them forward.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        p = tmp_path / "cloud_launch_state.json"
+        p.write_text("{}")
+        _deny_reads_of(monkeypatch, p)
+
+        with pytest.raises(LaunchRecordUnreadable) as exc:
+            LaunchState.load(p)
+
+        msg = str(exc.value)
+        assert str(p) in msg
+        assert "Permission denied" in msg
+        assert "kirocrew cloud list" in msg
+
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="POSIX permission modes; root reads through them",
+    )
+    def test_a_chmod_zero_record_refuses_with_no_monkeypatching(self, tmp_path, monkeypatch):
+        """The real filesystem shape, not a stub: a mode-0 file is the reported trigger."""
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        p = tmp_path / "cloud_launch_state.json"
+        p.write_text(json.dumps({"profile": "w", "region": "eu-west-1", "last_tag": "kc-live"}))
+        p.chmod(0)
+        try:
+            with pytest.raises(LaunchRecordUnreadable):
+                LaunchState.load(p)
+        finally:
+            # The temp directory's own cleanup must not trip over a mode the test set.
+            p.chmod(0o600)
+
+    def test_the_refusal_is_an_oserror_every_clear_caller_already_answers(
+        self, tmp_path, monkeypatch
+    ):
+        """The clear WRITES when its compare matches, so it may not compare against a guess.
+
+        An unreadable record may hold a concurrent launch's newer pointer, and any answer
+        built from other sources -- the legacy fields, an empty default -- lets the compare
+        run against substituted content. So the read refuses here too, as an ``OSError``,
+        which is the failure both clear callers already answer the same way they answer an
+        unlockable writer lock: the post-destroy clear warns without failing the completed
+        teardown, and the pre-launch clear aborts with nothing billed. The record's bytes
+        are untouched either way.
+        """
+        assert issubclass(LaunchRecordUnreadable, OSError)
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        p = tmp_path / "cloud_launch_state.json"
+        original = json.dumps({"profile": "w", "region": "eu-west-1", "last_tag": "kc-concurrent"})
+        p.write_text(original)
+        _deny_reads_of(monkeypatch, p)
+
+        with pytest.raises(LaunchRecordUnreadable):
+            LaunchState.try_clear_tag("kc-live", path=p)
+
+        assert p.read_text() == original
+
+    def test_an_unreadable_record_is_never_cleared_through_the_legacy_tag(
+        self, tmp_path, monkeypatch
+    ):
+        """The legacy tag can EQUAL the one being cleared while the record holds another.
+
+        Answering the compare from the legacy fields would match and overwrite the record's
+        unknown content with a cleared one -- a concurrent launch's pointer erased by a
+        destroy that never saw it. The refusal fires before any compare can run.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        (tmp_path / "cloud.json").write_text(
+            json.dumps({"profile": "p", "region": "us-east-1", "last_tag": "kc-live"})
+        )
+        p = tmp_path / "cloud_launch_state.json"
+        original = json.dumps({"profile": "w", "region": "eu-west-1", "last_tag": "kc-concurrent"})
+        p.write_text(original)
+        _deny_reads_of(monkeypatch, p)
+
+        with pytest.raises(LaunchRecordUnreadable):
+            LaunchState.try_clear_tag("kc-live", path=p)
+
+        assert p.read_text() == original
+
+    def test_the_pre_launch_clear_aborts_on_an_unreadable_record(self, tmp_path, monkeypatch):
+        """Before provisioning, the safe answer is a refusal: nothing is created or billed.
+
+        Proceeding would leave the pointer's unknown content as what a later no-tag
+        ``destroy`` resolves after this launch's own record write fails -- the exact shape
+        ``_clear_prior_pointer`` exists to remove. Its ``OSError`` arm already aborts for an
+        unlockable lock; the unreadable record rides the same arm.
+        """
+        from kiro_crew.cloud import wizard
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        failures: list[str] = []
+        monkeypatch.setattr(wizard.ui, "fail", lambda msg, *a, **k: failures.append(str(msg)))
+        monkeypatch.setattr(wizard.ui, "detail", lambda *a, **k: None)
+        p = tmp_path / "cloud_launch_state.json"
+        original = json.dumps({"profile": "w", "region": "eu-west-1", "last_tag": "kc-concurrent"})
+        p.write_text(original)
+        _deny_reads_of(monkeypatch, p)
+
+        assert wizard._clear_prior_pointer("kc-live") is False
+        assert failures and "kc-live" in failures[0]
+        assert p.read_text() == original
 
 
 class TestTheReadIsBoundedBeforeItAllocates:

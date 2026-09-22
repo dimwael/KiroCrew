@@ -58,6 +58,29 @@ _FILENAME = "cloud_launch_state.json"
 _MAX_FILE_BYTES = 64 * 1024
 
 
+class LaunchRecordUnreadable(OSError):
+    """An existing launch record cannot be read, so nothing is known about its tag.
+
+    Distinct from an ABSENT record, which is the one state where consulting the legacy
+    fields is safe: absence says there is no pointer here, while a failed read says there
+    IS one and its content is unknown. Falling back then hands ``cloud destroy --yes`` the
+    legacy tag, which can name an older stack than the one the unreadable record describes
+    -- the exact target substitution this module exists to prevent.
+
+    An ``OSError`` subclass on purpose. Every caller that touches this file already
+    answers ``OSError`` with the right per-site policy, which is the same measured reason
+    the writer lock is allowed to be strict: ``handle_cloud`` renders a named refusal for
+    every consuming verb, the pre-launch clear aborts with nothing provisioned and nothing
+    billed, and the post-destroy clear warns about a stale pointer rather than failing a
+    teardown whose irreversible work is done. Subclassing routes the refusal into each of
+    those answers without teaching every caller a second exception type.
+
+    The message names the file, the consequence and the command to run next, because the
+    condition is a HOST fault -- a permission mode, an I/O error -- that the operator
+    fixes, not the product.
+    """
+
+
 def state_path() -> Path:
     """The launch record's path, honouring ``KIROCREW_HOME`` through ``config_dir()``."""
     return config_dir() / _FILENAME
@@ -86,6 +109,15 @@ class LaunchState:
         is no record here -- and the legacy fields are then consulted, which is what keeps
         ``cloud resume`` working on an install that predates this file.
 
+        Tolerance is about content the read RETURNED. A record that exists but cannot be
+        READ is a third case the content/name pair does not cover: nothing is known about
+        its content -- it may be a valid pointer to the newest stack -- and the name
+        resolved fine. It refuses (:class:`LaunchRecordUnreadable`) rather than consulting
+        the legacy fields, because those fields can name an OLDER stack and this read is
+        what ``cloud destroy --yes`` resolves its target from. An operator shown a refusal
+        fixes a permission; one shown a successful destroy of the wrong stack cannot undo
+        it. Only genuine absence falls back.
+
         Refusing about the NAME, which is the opposite call and not a contradiction. A
         malformed document is a file with nothing in it worth acting on; a file reachable
         under a second name is a file whose tag an agent can choose, and the tag decides
@@ -108,12 +140,17 @@ class LaunchState:
     def _load_unguarded(cls, p: Path) -> "LaunchState":
         """The read itself, with no alias refusal. For :meth:`clear_tag` only.
 
-        ``clear_tag`` runs AFTER ``destroy`` has already deleted the stack, so nothing it
-        does may raise: a refusal there would abort a command whose irreversible work is
-        done, which is the failure shape this module exists to have removed. The tag it
-        compares against came from a consume point that already refused an aliased file, so
-        the check is not skipped -- it happened earlier, where its answer could still change
-        what the command did.
+        ``clear_tag`` runs AFTER ``destroy`` has already deleted the stack, so the ALIAS
+        refusal is skipped here rather than raised: the tag it compares against came from a
+        consume point that already refused an aliased file, so the check is not skipped --
+        it happened earlier, where its answer could still change what the command did.
+
+        An UNREADABLE record still propagates (:class:`LaunchRecordUnreadable`), because
+        the clear WRITES when its compare matches and no compare against substituted
+        content is safe. That does not fail the completed teardown: the refusal is an
+        ``OSError``, and every ``clear_tag`` caller already answers ``OSError`` -- the
+        post-destroy one by warning about a stale pointer, the pre-launch one by aborting
+        with nothing billed -- the same measured reason the writer lock is allowed to raise.
         """
         return cls._load(p, guard_legacy=False)
 
@@ -128,6 +165,15 @@ class LaunchState:
         pre-creates, so it is the DEFAULT on any install that has spawned an agent -- hands a
         forged ``last_tag`` to ``cloud destroy`` and the wrong stack is deleted. The guard
         belongs on both files because either one can be the one the tag came from.
+
+        An UNREADABLE record propagates from here on BOTH entry points, and the flag takes
+        no part in it: the record exists, nothing is known about its content -- it may be a
+        concurrent launch's newer pointer -- so no answer built from other sources is safe
+        to act on, and the clear in particular WRITES when its compare matches. Each caller
+        already answers the refusal (see :class:`LaunchRecordUnreadable`): the consuming
+        verbs refuse, the pre-launch clear aborts before anything is provisioned, and the
+        post-destroy clear warns about a stale pointer without failing the completed
+        teardown.
         """
         data = _read_document(p)
         # A document carrying NONE of the three keys is not a record -- it is the empty
@@ -294,7 +340,17 @@ def _writer_lock(p: Path) -> "Iterator[None]":
 
 
 def _read_document(p: Path) -> "Optional[dict]":
-    """The file as a JSON object, or ``None`` for every way it is not one.
+    """The file as a JSON object, ``None`` for every way its CONTENT is not one, and
+    :class:`LaunchRecordUnreadable` for a file that exists but cannot be read at all.
+
+    The two answers are different because they rest on different knowledge. Every ``None``
+    below follows a read that RETURNED something -- too many bytes, bytes that do not
+    decode, a decoded value that is not an object -- so "there is nothing here worth acting
+    on" is a judgment about content actually seen. A failed ``open`` or ``read`` saw
+    nothing: the record exists and may be a perfectly valid pointer to a NEWER stack than
+    the legacy fields name, so answering ``None`` would substitute the destroy target.
+    Only ``FileNotFoundError`` keeps the quiet answer, because absence is the one failure
+    that genuinely means "no record here".
 
     Reads at most one byte PAST the ceiling and decides from that, so an oversized file is
     never allocated. Reading it whole and checking the length afterwards is not a bound: the
@@ -311,8 +367,18 @@ def _read_document(p: Path) -> "Optional[dict]":
     try:
         with open(p, "rb") as fh:
             raw = fh.read(_MAX_FILE_BYTES + 1)
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise LaunchRecordUnreadable(
+            f"the launch record {p} exists but cannot be read ({exc}). Its tag is the "
+            "stack `kirocrew cloud destroy --yes` deletes when no `--tag` is given, and "
+            "the legacy fallback can name an older stack than this record describes, so "
+            "the command refuses instead of guessing. Fix the file's permissions and "
+            "retry, or pass an explicit `--tag`; `kirocrew cloud list` shows your "
+            "instances. Deleting the record does not make this safe: an absent record is "
+            "exactly what re-enables the legacy fallback."
+        ) from exc
     if len(raw) > _MAX_FILE_BYTES:
         logger.warning("launch state: %s is larger than %d bytes; ignoring it", p, _MAX_FILE_BYTES)
         return None

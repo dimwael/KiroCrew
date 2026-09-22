@@ -255,6 +255,56 @@ class TestDestroy:
         else:
             assert f"rm {shlex.quote(str(record))}" in text
 
+    def test_destroy_refuses_an_unreadable_record_and_deletes_nothing(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        """The whole command: an unreadable record must not resolve the legacy tag.
+
+        The record exists, so a pointer exists and nothing is known about it; the legacy
+        fields in ``cloud.json`` can name an OLDER stack, and ``--yes`` is exactly the path
+        that does not stop to describe what it found. The refusal has to land before any
+        stack is described, and read as a named refusal an operator can fix, not a
+        traceback and not a successful destroy of the wrong stack.
+        """
+        import builtins
+        from pathlib import Path
+
+        from kiro_crew.cloud import launch_state as launch_state_module
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        (tmp_path / "cloud.json").write_text(
+            '{"profile": "p", "region": "us-east-1", "last_tag": "kc-older"}'
+        )
+        record = tmp_path / "cloud_launch_state.json"
+        record.write_text('{"profile": "p", "region": "us-east-1", "last_tag": "kc-newest"}')
+
+        real_open = builtins.open
+
+        def deny(file, *args, **kwargs):
+            if Path(file) == record:
+                raise PermissionError(13, "Permission denied", str(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(launch_state_module, "open", deny, raising=False)
+
+        def _must_not_run(*a, **k):
+            raise AssertionError("an unreadable record must not reach AWS")
+
+        monkeypatch.setattr(ec2, "describe", _must_not_run)
+        monkeypatch.setattr(ec2, "destroy", _must_not_run)
+
+        rc = cli_cloud.handle_cloud(
+            _args(cloud_action="destroy", profile="", region="", tag="", dry_run=False, yes=True)
+        )
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        text = captured.out + captured.err
+        assert "cloud_launch_state.json" in text
+        assert "kirocrew cloud list" in text
+        # And the tag the fallback would have resolved never surfaces anywhere.
+        assert "kc-older" not in text
+
     def test_launch_refuses_an_aliased_record_before_re_attaching(
         self, monkeypatch, capsys, tmp_path
     ):
