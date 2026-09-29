@@ -6528,6 +6528,84 @@ class AutoNudgeService:
             return False
         return True
 
+    async def _commit_judge_pr_seen(
+        self,
+        loop: NudgeLoop,
+        staged_pr_seen: dict,
+        *,
+        staged_for_spec: Any,
+        staged_for_message: str,
+    ) -> bool | None:
+        """Make *staged_pr_seen* this loop's pull-request baseline, disk first.
+
+        ``True`` once the baseline is durable and published, ``False`` when the record
+        refused it, ``None`` when the loop was re-aimed and there is nothing to commit.
+
+        PERSISTED FIRST, the same way the reading itself is published. The stored
+        record is this baseline's authority -- the loader restores it from the
+        snapshot -- and the awaited judge write that reached the verdict has already
+        landed one holding the OLD baseline. So the new one is written on a staged copy
+        and copied over the live loop only once that write has landed. Memory never
+        runs ahead of disk: a refused write publishes nothing, so the baseline stays
+        exactly what the record holds, and the next tick re-reads these remarks --
+        which costs a turn and withholds nothing.
+
+        AWAITED under ``_lock`` for both halves of the same reason. The write has to
+        land before the tick's own scheduled write, or a process that stops in between
+        leaves disk claiming the old baseline while this tick has already screened
+        against the new one, and every remark it passed on reads as new after the
+        restart. And the snapshot is taken under the lock so no update can land between
+        the copy and the write, which would put a stale row on disk. Holding the lock
+        across the write is also what keeps every other writer's snapshot honest: none
+        can serialize the loop while its baseline is half-committed.
+
+        ONLY THE BASELINE is published, never the whole staged copy. The lock does not
+        cover every writer: ``notify_cycle_landed`` clears the start-failure streak on
+        the live loop synchronously and lock-free, from the turn-completion path, and
+        can land inside the awaited write. Copying every field of the snapshot back over
+        the live loop -- what ``_apply_staged_monitor`` does for a full monitor
+        transition -- would silently put that streak back and let the loop back off or
+        stand down on a failure a completed turn has just disproved. Writing one field
+        cannot revert another.
+
+        A write that lands and is then cancelled still publishes: the snapshot writer
+        propagates the cancellation only after the executor result is in, so disk holds
+        the new baseline, and a memory left on the old one would hand the next tick a
+        record it does not match.
+
+        The re-aim check runs under the lock too. An ``update`` that retargets the
+        message or replaces the criteria clears the baseline deliberately, because a
+        digest earned under the old question would screen the new one quiet; the caller
+        checks the same thing before the await, but an update can land while this call
+        waits for the lock.
+        """
+        from kiro_crew import autonudge_judge as judge
+
+        async with self._lock:
+            if (
+                self._loops.get(loop.id) is not loop
+                or judge.spec_of(loop) != staged_for_spec
+                or loop.message != staged_for_message
+            ):
+                return None
+            staged = deepcopy(loop)
+            staged.judge_pr_seen = staged_pr_seen
+            payload = self._monitor_snapshot_with_replacement(loop, staged)
+            try:
+                await self._write_monitor_snapshot_locked(payload)
+            except asyncio.CancelledError:
+                loop.judge_pr_seen = staged_pr_seen
+                raise
+            except Exception:
+                logger.warning(
+                    "AutoNudge: could not persist the pull-request baseline for loop %s",
+                    loop.id,
+                    exc_info=True,
+                )
+                return False
+            loop.judge_pr_seen = staged_pr_seen
+        return True
+
     async def _publish_pr_observation(
         self, loop: NudgeLoop, monitor: MonitorState, observation: Any
     ) -> tuple[bool, dict] | None:
@@ -7173,32 +7251,25 @@ class AutoNudgeService:
             # the await and nothing here runs, which is what leaves the baseline as it
             # was and the new remark still unseen.
             if staged_pr_seen:
-                if judge.spec_of(loop) == staged_for_spec and loop.message == staged_for_message:
-                    loop.judge_pr_seen = staged_pr_seen
-                    # AWAITED here, not left to the scheduled write below. The stored
-                    # record is this baseline's authority -- the loader restores it from
-                    # the snapshot -- and the awaited judge write inside the call above
-                    # has already landed one holding the OLD baseline. A scheduled write
-                    # that has not landed when the process stops therefore leaves disk
-                    # claiming the old baseline while this tick has already screened
-                    # against the new one, and every remark it passed on reads as new
-                    # after the restart. Awaiting it here covers every branch below,
-                    # which each return after a scheduled write of their own.
-                    if not await self._persist_judge_state(loop):
-                        # Memory may not claim what disk does not. Dropping the commit
-                        # leaves the baseline exactly as the stored record has it, so the
-                        # next tick re-reads these remarks -- which costs a turn and
-                        # withholds nothing, the only safe direction here.
-                        loop.judge_pr_seen = {}
-                        logger.warning(
-                            "AutoNudge: loop %s judged but its pull-request baseline did "
-                            "not persist -- leaving the stored baseline in force",
-                            loop.id,
-                        )
-                else:
+                committed = await self._commit_judge_pr_seen(
+                    loop,
+                    staged_pr_seen,
+                    staged_for_spec=staged_for_spec,
+                    staged_for_message=staged_for_message,
+                )
+                if committed is None:
                     logger.info(
                         "AutoNudge: loop %s was re-aimed while this tick judged -- "
                         "leaving its pull-request baseline cleared",
+                        loop.id,
+                    )
+                elif not committed:
+                    # Nothing was published, so the baseline is exactly what the stored
+                    # record has: the next tick re-reads these remarks, which costs a
+                    # turn and withholds nothing, the only safe direction here.
+                    logger.warning(
+                        "AutoNudge: loop %s judged but its pull-request baseline did "
+                        "not persist -- leaving the stored baseline in force",
                         loop.id,
                     )
             if judged is False:
