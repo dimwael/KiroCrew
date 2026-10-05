@@ -23,41 +23,170 @@ if TYPE_CHECKING:
 logger = logging.getLogger("kiro_crew.skills")
 
 
+# A directory this create made: its path and the ``(st_dev, st_ino)`` it had
+# immediately after the ``mkdir`` that brought it into being.
+_MadeDir = tuple[Path, tuple[int, int]]
+
+
 def create_skill(loader: SkillsLoader, name: str, content: str) -> bool:
     """Create a new skill directory with SKILL.md.  Returns True on success."""
-    from kiro_crew import skills as sk  # circular import: the facade imports this module
-
     if not loader._safe_name(name):
         return False
     skill_dir = loader._dir / name
     if skill_dir.exists():
         return False
-    if not sk._DIR_FD_SUPPORTED:
-        # exist_ok=False so a skill directory that appeared between the
-        # exists() check above and here is REFUSED rather than written
-        # through: two concurrent creates would otherwise both mkdir, both
-        # write_text the same SKILL.md, and both report success, losing one
-        # submitted body. The pinned branch answers the same way, through
-        # its own O_EXCL-equivalent -- os.mkdir under the pinned parent raising
-        # FileExistsError -- so without this the two branches of this fork
-        # disagree on the same request. parents=True
-        # still creates the intermediates a nested name needs; only the leaf
-        # is refused.
+    # A nested name has intermediates this create brings into being. If a later
+    # step fails -- the host refusing the joined path for its length is the
+    # reachable case -- those intermediates would stay, and the next create of the
+    # parent name would meet the exists() guard above and be refused as a
+    # duplicate of a skill that has no SKILL.md. So every directory this call
+    # makes is recorded with its identity, and a failed create gives back exactly
+    # those and nothing else.
+    made: list[_MadeDir] = []
+    try:
+        return _create_skill_tree(loader, name, content, skill_dir, made)
+    except OSError:
+        _unwind_made_dirs(made)
+        raise
+
+
+def _make_missing_dirs(root: Path, target: Path, made: list[_MadeDir]) -> None:
+    """Create every missing directory from just below *root* down to *target*.
+
+    Each level is made with its own ``os.mkdir`` -- no ``exist_ok``, no
+    ``parents=True`` -- so whether THIS call made a level is the syscall's answer,
+    not an earlier probe's. A level whose ``mkdir`` raises ``FileExistsError``
+    belongs to someone else (a concurrent create of the parent name, or a tree
+    that was always there) and is never recorded, so the unwind can never address
+    it. A level this call did make is recorded with the identity an immediate
+    ``lstat`` reports, which is what the unwind checks before removing it.
+
+    *root* itself is ensured but never recorded: the skills root is not a create's
+    to give back.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    p = root
+    for part in target.relative_to(root).parts:
+        p = p / part
         try:
-            skill_dir.mkdir(parents=True, exist_ok=False)
+            os.mkdir(p)
+        except FileExistsError:
+            continue
+        st = os.lstat(p)
+        made.append((p, (st.st_dev, st.st_ino)))
+
+
+def _unwind_made_dirs(made: list[_MadeDir]) -> None:
+    """Remove the directories a failed create made, deepest first.
+
+    A directory is removed only while the object at its path is still the one this
+    call made -- same ``(st_dev, st_ino)`` from a fresh ``lstat`` -- and only by
+    ``rmdir``, which refuses a directory that is not empty. A level that a
+    concurrent writer replaced, or has already put something in, is skipped
+    silently: it is that writer's now. Best effort, and never raises: the create's
+    own error is the one the caller reports.
+    """
+    for path, identity in reversed(made):
+        try:
+            st = os.lstat(path)
+            if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != identity:
+                continue
+            os.rmdir(path)
+        except OSError:
+            continue
+
+
+def _parent_vanished(parent: Path, parent_fd: int | None = None) -> bool:
+    """Whether the parent this create just set up is gone: no directory answers to
+    its name any more, or the directory *parent_fd* holds has been unlinked.
+
+    That is the one ``FileNotFoundError`` a retry can repair -- a concurrent
+    create's unwind removing a still-empty parent between this create's parent
+    setup and its leaf -- so every other one keeps propagating as before.
+    """
+    try:
+        if parent_fd is not None and os.fstat(parent_fd).st_nlink == 0:
+            return True
+        return not stat.S_ISDIR(os.lstat(parent).st_mode)
+    except OSError:
+        return True
+
+
+def _create_skill_tree(
+    loader: SkillsLoader, name: str, content: str, skill_dir: Path, made: list[_MadeDir]
+) -> bool:
+    """Make *skill_dir* and its SKILL.md on whichever branch this platform has,
+    recording in *made* every directory it brings into being.
+
+    A parent this create found already present belongs to a concurrent create,
+    and that create's own failed unwind can remove it while it is still empty --
+    after this create's parent setup and before its leaf. So when the leaf step
+    meets a vanished parent, the parent setup runs ONE more time (recording any
+    level it makes, so this create's own unwind still covers it) and the leaf
+    step is retried once; a second miss propagates as it always has.
+    """
+    for retry in (True, False):
+        _make_missing_dirs(loader._dir, skill_dir.parent, made)
+        try:
+            return _create_skill_leaf(loader, name, content, skill_dir, made, retry=retry)
+        except _ParentVanished:
+            continue
+    raise AssertionError("unreachable: the second attempt never retries")
+
+
+class _ParentVanished(Exception):
+    """The leaf step found its parent gone and may be retried once."""
+
+
+def _create_skill_leaf(
+    loader: SkillsLoader,
+    name: str,
+    content: str,
+    skill_dir: Path,
+    made: list[_MadeDir],
+    *,
+    retry: bool,
+) -> bool:
+    """Make the leaf *skill_dir* and its SKILL.md under the parent already set up.
+
+    Raises ``_ParentVanished`` instead of the miss when *retry* is set and the
+    parent is what went missing.
+    """
+    from kiro_crew import skills as sk  # circular import: the facade imports this module
+
+    if not sk._DIR_FD_SUPPORTED:
+        # The leaf is made with its own os.mkdir, so a skill directory that
+        # appeared between the exists() check above and here is REFUSED rather
+        # than written through: two concurrent creates would otherwise both
+        # mkdir, both write_text the same SKILL.md, and both report success,
+        # losing one submitted body. The pinned branch answers the same way,
+        # through its own O_EXCL-equivalent -- os.mkdir under the pinned parent
+        # raising FileExistsError -- so the two branches agree on the same
+        # request. The intermediates a nested name needs were made level by
+        # level first; only the leaf is refused.
+        try:
+            os.mkdir(skill_dir)
         except FileExistsError:
             return False
+        except FileNotFoundError:
+            if retry and _parent_vanished(skill_dir.parent):
+                raise _ParentVanished() from None
+            raise
+        st = os.lstat(skill_dir)
+        made.append((skill_dir, (st.st_dev, st.st_ino)))
         (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
         loader._invalidate_iter_cache()  # so the new skill shows in list_skills() now
         logger.info("Created skill: %s", name)
         return True
 
-    # Ensure the intermediate tree by name (a nested skill name has parents
-    # the caller owns), then create the leaf skill dir and its SKILL.md
-    # relative to a pinned descriptor so an ancestor swapped for a link after
-    # the exists() check cannot redirect the write. The leaf mkdir refuses a
-    # skill dir that appeared in the meantime, matching the exists() guard.
-    skill_dir.parent.mkdir(parents=True, exist_ok=True)
+    # The intermediate tree was ensured by name (a nested skill name has parents
+    # the caller owns); the leaf skill dir and its SKILL.md are created relative
+    # to a pinned descriptor so an ancestor swapped for a link after the exists()
+    # check cannot redirect the write. The leaf mkdir refuses a skill dir that
+    # appeared in the meantime, matching the exists() guard. The leaf is not
+    # recorded in *made*: _create_skill_pinned rolls it back itself, verified
+    # through the descriptor that created it.
+    #
     # ONE resolution of the parent chain, and everything below it addressed
     # through the descriptor it produced: the leaf directory, its SKILL.md, and
     # the rollback that removes both. A second walk would be a second chance for
@@ -68,9 +197,17 @@ def create_skill(loader: SkillsLoader, name: str, content: str) -> bool:
     except sk.pinned_fs.PinnedPathRefusal:
         return False
     except OSError:
+        if retry and _parent_vanished(skill_dir.parent):
+            raise _ParentVanished() from None
         return False
     try:
-        return loader._create_skill_pinned(name, content, skill_dir, parent_fd)
+        try:
+            return loader._create_skill_pinned(name, content, skill_dir, parent_fd)
+        except FileNotFoundError:
+            # mkdir under a descriptor whose directory was unlinked answers ENOENT.
+            if retry and _parent_vanished(skill_dir.parent, parent_fd):
+                raise _ParentVanished() from None
+            raise
     finally:
         os.close(parent_fd)
 
