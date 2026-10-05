@@ -1456,6 +1456,13 @@ def _slack_orch():
     return orch, task
 
 
+def _callers(ts):
+    """A queue entry the presser of ``_run_slack_stop`` queued, tagged as Slack tags it."""
+    from kiro_crew.slack import events as ev
+
+    return (ts, "text", {"paths": [], **ev._queue_tags("U_OWNER", "D1")})
+
+
 def _run_slack_stop(orch):
     from unittest.mock import patch
 
@@ -1528,12 +1535,13 @@ def test_slack_stop_detaches_at_the_press_and_drops_only_that():
     """What was queued at the press is taken out of the live queue BEFORE the first
     await (so the cancelled turn's drain cannot start it), then dropped once the
     stop went through. A message admitted mid-stop is newer intent and stays."""
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import AsyncMock, MagicMock, patch
 
     orch, task = _slack_orch()
     orch.sessions.is_compacting = MagicMock(return_value=False)
-    at_press = ("q-at-press",)
+    at_press = (_callers("q-at-press"),)
     orch.sessions.detach_queue = MagicMock(return_value=at_press)
+    orch._pending_queue = {"100.0": [_callers("ts")]}
     late = ("ts-late", "sent during the stop", {"paths": []})
 
     async def _stop(*_a, **_k):
@@ -1543,11 +1551,14 @@ def test_slack_stop_detaches_at_the_press_and_drops_only_that():
         return "soft"
 
     orch.sessions.stop_turn = AsyncMock(side_effect=_stop)
-    unlink = _run_slack_stop(orch)
+    dispatched = AsyncMock()
+    with patch("kiro_crew.slack.events._dispatch_queued", new=dispatched):
+        unlink = _run_slack_stop(orch)
     orch.sessions.detach_queue.assert_called_once_with("100.0")
     orch.sessions.clear_queue.assert_called_once_with("100.0", only=at_press)
     orch.sessions.restore_queue.assert_not_called()
-    assert orch._pending_queue["100.0"] == [late]
+    # Kept, and the next thing dispatched once the stop is done.
+    assert [call.args[2] for call in dispatched.await_args_list] == ["ts-late"]
     assert unlink.call_count == 1  # the press-time pending entry's files
 
 
@@ -1559,7 +1570,7 @@ def test_slack_stop_tells_stop_turn_to_keep_the_queue_it_did_not_detach():
 
     orch, task = _slack_orch()
     orch.sessions.is_compacting = MagicMock(return_value=False)
-    at_press = ("q-at-press",)
+    at_press = (_callers("q-at-press"),)
     orch.sessions.detach_queue = MagicMock(return_value=at_press)
     orch.sessions.stop_turn = AsyncMock(return_value="soft")
     _run_slack_stop(orch)
@@ -1897,9 +1908,10 @@ def test_slack_stop_hands_the_detached_queue_on_when_the_raising_stop_already_po
 
 
 def test_slack_forced_repeat_carries_the_detached_queue_to_the_successor():
-    """A Slack entry does not say who sent it, so on the forced repeat (hard reset)
-    everything detached at the press goes to the successor instead of being
-    dropped: the Stop was aimed at the compaction, not at the shared queue."""
+    """On the forced repeat (hard reset) everything detached at the press goes to
+    the successor instead of being dropped, the presser's own included: the Stop
+    was aimed at the compaction, not at the shared queue. The pending stash goes
+    back too, and is the next thing the stop's drain dispatches."""
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from kiro_crew.session_lifecycle import note_stop_declined
@@ -1911,13 +1923,15 @@ def test_slack_forced_repeat_carries_the_detached_queue_to_the_successor():
     pending_at_press = list(orch._pending_queue["100.0"])
     orch.sessions.stop_turn = AsyncMock(return_value="hard")
     note_stop_declined("100.0", "U_OWNER")  # the first press was declined
+    dispatched = AsyncMock()
     with patch("kiro_crew.slack.events.hand_queue_to_successor", new=AsyncMock()) as hand:
-        unlink = _run_slack_stop(orch)
+        with patch("kiro_crew.slack.events._dispatch_queued", new=dispatched):
+            unlink = _run_slack_stop(orch)
     assert orch.sessions.stop_turn.await_args.kwargs["force"] is True
     hand.assert_awaited_once_with(orch.sessions, "100.0", at_press)
     orch.sessions.clear_queue.assert_not_called()
     unlink.assert_not_called()
-    assert orch._pending_queue["100.0"] == pending_at_press
+    assert [call.args[2:] for call in dispatched.await_args_list] == [tuple(pending_at_press[0])]
 
 
 @pytest.mark.asyncio
