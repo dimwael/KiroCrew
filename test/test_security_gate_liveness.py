@@ -198,7 +198,15 @@ def _url_payload_command(n: int) -> str:
 #: Raised again, from 28,572, for ``StreamRedactor``'s two read-only properties,
 #: ``held`` and ``discarding``, which the Slack stream reads at a ``wait`` instead
 #: of the private fields. No pattern moved.
-_PACKAGE_LINE_BUDGET = 28_582
+#:
+#: Raised again, from 28,582, for the ``-d @`` benign-program carve-out in
+#: ``exfil.py``: the bare-substring data-exfil denial false-positives on GNU
+#: ``date`` epoch conversions and ``grep`` searches for the literal ``-d @``.
+#: The denial is unchanged; the carve-out reuses ``denied_rules._exception_eligible``
+#: and allows the hit only for a single plain command whose first word runs no
+#: subcommand. It is a security-deciding predicate, so it cannot leave the package,
+#: and no dead code remains to offset it.
+_PACKAGE_LINE_BUDGET = 28_614
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
