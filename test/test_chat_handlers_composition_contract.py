@@ -433,7 +433,7 @@ async def test_the_handover_exit_reports_the_close_on_a_committed_drain_only(
     """
     events: list[str] = []
 
-    async def _drain(_state, name, _slot):
+    async def _drain(_state, name, _slot, takeover_basis=None):
         events.append(f"drain:{name}")
         return ch._HandoverDrainResult(rows_committed=committed, prompts_lost=0)
 
