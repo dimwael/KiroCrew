@@ -276,7 +276,9 @@ When Kiro Crew presents choices, each one is a button: one click sends that
 choice back to the conversation. To send several at once, open the card's ⋯ menu
 and pick **Choose several…**, then tick them in the dialog and press Send. Once a
 card is answered its buttons give way to a line saying who chose what and when;
-a later click on it only gets a private "Already answered".
+a later click on it only gets a private "Already answered". A message you type
+while a choice is being answered waits with ⏳, like any message sent during a
+turn, and is answered once that reply ends.
 
 ## Access control
 
